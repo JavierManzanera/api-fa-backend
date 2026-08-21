@@ -1,0 +1,31 @@
+# Minimal, disposable PostgreSQL instance for the test suite (OBJ-000).
+#
+# Why Postgres and not SQLite: app/models/user.py and app/models/verification.py
+# use sqlalchemy.dialects.postgresql.UUID(as_uuid=True), a dialect-specific type
+# that is not guaranteed to behave the same on SQLite. Swapping to SQLite for
+# test convenience was explicitly ruled out (see tests/README.md).
+#
+# Port 5433 (not 5432) deliberately, to avoid colliding with any developer's
+# local/system PostgreSQL instance already listening on the default port.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d
+#   pytest
+#   docker compose -f docker-compose.test.yml down -v
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: api-fa-backend-postgres-test
+    environment:
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: api_fa_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d api_fa_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 20

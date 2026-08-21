@@ -1,0 +1,510 @@
+openapi: 3.1.0
+info:
+  title: api-fa-backend — Reusable Hardened Auth Service
+  description: >-
+    API-First contract for the reusable FastAPI auth starter ("bloque hiperseguro").
+    This file is the full source of truth for all HTTP-facing behavior — it documents
+    both the endpoints already implemented (register/login/forgot-password/verify-otp/
+    reset-password/refresh) and the OBJ-001 remediation surface (JWT type confusion,
+    OTP brute-force hardening, rate limiting). Config/startup-only requirements that
+    have no HTTP surface (e.g. SECRET_KEY validation) are intentionally NOT modeled
+    here — see `docs/api/obj-001-design-notes.md` §4.
+  version: "0.2.0-obj-001"
+  contact:
+    name: solution-architect (PRJ-003)
+servers:
+  - url: /api/v1
+    description: Versioned API root (matches `settings.API_V1_STR`)
+
+tags:
+  - name: auth
+    description: >-
+      Owns all identity/credential/session data for this service (users, verification
+      codes, tokens). No other module in this template owns auth-related persistence —
+      any forked project extending this template should keep it that way.
+
+security: []  # default: unauthenticated. Individual operations opt into `bearerAuth`.
+
+paths:
+  /auth/register:
+    post:
+      operationId: registerUser
+      tags: [auth]
+      summary: Create a new user account
+      description: >-
+        Unchanged by OBJ-001. Current behavior explicitly enumerates existing emails
+        via 400 — this is a known, separately-tracked decision (OBJ-007), not part of
+        this objective's scope. Documented here for completeness only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "The user with this email already exists in the system."
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/login:
+    post:
+      operationId: login
+      tags: [auth]
+      summary: Exchange credentials for an access/refresh token pair
+      description: >-
+        Unchanged by OBJ-001 (timing side-channel on this endpoint is audit finding #5,
+        scoped to OBJ-003). Both tokens returned here now carry the explicit `type`
+        claim described in the design notes — `access_token` decodes to `type=access`,
+        `refresh_token` decodes to `type=refresh`. This is the only behavioral change
+        on this endpoint for OBJ-001; request/response shape is unchanged.
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/LoginForm'
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '400':
+          description: Invalid credentials or inactive user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              examples:
+                bad_credentials:
+                  value: { detail: "Incorrect email or password" }
+                inactive:
+                  value: { detail: "Inactive user" }
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/forgot-password:
+    post:
+      operationId: forgotPassword
+      tags: [auth]
+      summary: Request a password-reset OTP
+      description: >-
+        **Changed by OBJ-001 (finding #2).** Response shape and the always-generic 200
+        message are unchanged (anti-enumeration property preserved). New behavior:
+
+        - IP-based rate limiting (429) — see `RateLimitError`.
+        - A per-(email, purpose) issuance cooldown is enforced **silently**: a repeat
+          request within the cooldown window for an email that already has a live,
+          non-expired OTP still returns the same generic 200 and does **not** rotate
+          the existing code or reset its `attempts` counter. No distinct status code
+          or message is used for this case — introducing one would recreate the
+          existence oracle this endpoint already avoids.
+        - OTP generation moves from `random.choices` to `secrets`-based generation
+          (implementation detail, not a contract change — see design notes §3).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+      responses:
+        '200':
+          description: >-
+            Always returned regardless of whether the email exists (anti-enumeration).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                msg: "If the email exists, an OTP has been sent."
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/verify-otp:
+    post:
+      operationId: verifyOtp
+      tags: [auth]
+      summary: Check an OTP without consuming it
+      description: >-
+        **Changed by OBJ-001 (finding #2).** Success/failure response shape is
+        unchanged. What changes is failure accounting: every failed check (wrong code,
+        expired code, or no live code at all) increments the `attempts` counter on the
+        active `Verification` row for that `(email, purpose)` pair — the **same**
+        counter that `/auth/reset-password` increments on failure, since this endpoint
+        is a free oracle against that row (audit finding #2). Once `attempts` reaches
+        the configured maximum, the row is invalidated server-side (fail-closed) and
+        every subsequent check — correct code or not — returns the identical 400 below
+        until a new OTP is requested via `/auth/forgot-password`. There is deliberately
+        **no distinct "locked out" response**: reusing the generic 400 prevents this
+        endpoint from telling an attacker whether they hit the attempt cap or just
+        guessed wrong.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTPVerifyRequest'
+      responses:
+        '200':
+          description: OTP is valid, unexpired, and not locked out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                msg: "OTP verified successfully"
+        '400':
+          description: >-
+            Invalid, expired, or attempt-locked-out OTP. All three cases are
+            indistinguishable by design (see summary above).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Invalid or expired OTP"
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/reset-password:
+    post:
+      operationId: resetPassword
+      tags: [auth]
+      summary: Consume an OTP to set a new password
+      description: >-
+        **Changed by OBJ-001 (finding #2).** Same failure-accounting change as
+        `/auth/verify-otp` (shared `attempts` counter, identical fail-closed 400,
+        no distinct lockout signal). Success path (OTP consumed, `Verification` row
+        deleted) is unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '200':
+          description: Password updated; the OTP is consumed (deleted) and cannot be reused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                msg: "Password updated successfully"
+        '400':
+          description: >-
+            Invalid, expired, or attempt-locked-out OTP (indistinguishable — see
+            `/auth/verify-otp`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Invalid or expired OTP"
+        '404':
+          description: >-
+            OTP was valid but the user record no longer exists (deleted between
+            `/forgot-password` and `/reset-password`). Unchanged edge case from
+            existing code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "User not found"
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/refresh:
+    post:
+      operationId: refreshAccessToken
+      tags: [auth]
+      summary: Exchange a valid refresh token for a new access token
+      description: >-
+        **Changed by OBJ-001 (finding #1).** `verify_refresh_token` now enforces
+        `type == "refresh"` (previously only checked the legacy `refresh: true` claim,
+        which is being replaced — see design notes §1). Rejection status changes from
+        `400` to `401` for all token-validity failures (bad signature, expired,
+        malformed, **or wrong `type`** — e.g. an access token submitted here) to align
+        with the rest of the auth-failure surface. The "valid token, but user
+        inactive/deleted" branch is unchanged and stays `400` (a business-state error,
+        not a credential-validation failure).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: >-
+            New access token issued. `refresh_token` in the response is currently the
+            same token that was submitted (no rotation yet — rotation + reuse
+            detection is OBJ-002, out of scope here).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Token'
+        '400':
+          description: Token was valid but the associated user is inactive or no longer exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "User inactive or not found"
+        '401':
+          description: >-
+            Token is malformed, has an invalid signature, is expired, or has
+            `type != "refresh"` (includes an access token being replayed here).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Invalid or expired refresh token"
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/me:
+    get:
+      operationId: getCurrentUser
+      tags: [auth]
+      summary: Return the authenticated user (proposed — see design notes §5)
+      description: >-
+        **New endpoint proposed as part of OBJ-001, not yet in `auth.py`.** Today
+        `deps.get_current_user` has zero real consumers, which means finding #1's
+        fix (rejecting a refresh token used as a Bearer access token) has no HTTP
+        surface to contract-test end-to-end. This minimal protected endpoint gives
+        `qa-engineer` a concrete target for that regression test and gives every
+        project forking this template a canonical "protected route" example. Flagged
+        for explicit confirmation — see final summary.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current authenticated user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          description: >-
+            Missing/malformed `Authorization` header, invalid signature, expired
+            token, missing `sub`, unknown user, **or `type != "access"`** — this last
+            case is finding #1's fail-closed fix: a refresh token presented here is
+            rejected with this same generic message, not a distinguishing one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Could not validate credentials"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Access token only. `app/api/deps.get_current_user` decodes the token and
+        rejects it (401) unless the `type` claim is exactly `"access"` — a refresh
+        token is fail-closed rejected here, never accepted as a substitute (audit
+        finding #1). See design notes §1 for the full claim schema.
+
+  responses:
+    ValidationError:
+      description: Request body failed schema validation (Pydantic)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HTTPValidationError'
+
+    RateLimited:
+      description: >-
+        Too many requests from this client (IP-based). Distinct from, and unrelated
+        to, OTP attempt lockout — see design notes §2 for why these two mechanisms are
+        kept separate.
+      headers:
+        Retry-After:
+          description: Seconds until the client may retry.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HTTPError'
+          example:
+            detail: "Too many requests. Please try again later."
+
+  schemas:
+    UserCreate:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: >-
+            Must contain at least one uppercase letter, one digit, and one special
+            character (`!@#$%^&*()_+-=[]{}|;':",./<>?`). Enforced by
+            `validate_password_strength` (unchanged by OBJ-001).
+
+    UserResponse:
+      type: object
+      required: [id, email, is_active, is_verified, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        is_active:
+          type: boolean
+        is_verified:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+      description: Never includes `hashed_password` (audit-confirmed PASS, unchanged).
+
+    LoginForm:
+      type: object
+      required: [username, password]
+      description: OAuth2 password-grant form (`OAuth2PasswordRequestForm`, unchanged).
+      properties:
+        grant_type:
+          type: string
+          enum: ["password"]
+          nullable: true
+        username:
+          type: string
+          format: email
+          description: The user's email, despite the OAuth2 field name `username`.
+        password:
+          type: string
+        scope:
+          type: string
+          default: ""
+        client_id:
+          type: string
+          nullable: true
+        client_secret:
+          type: string
+          nullable: true
+
+    Token:
+      type: object
+      required: [access_token, token_type, refresh_token]
+      properties:
+        access_token:
+          type: string
+          description: 'JWT with claims `{sub, exp, iat, type: "access"}`.'
+        token_type:
+          type: string
+          enum: ["bearer"]
+        refresh_token:
+          type: string
+          description: 'JWT with claims `{sub, exp, iat, type: "refresh"}`.'
+
+    EmailRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    OTPVerifyRequest:
+      type: object
+      required: [email, otp]
+      properties:
+        email:
+          type: string
+          format: email
+        otp:
+          type: string
+          pattern: '^\d{6}$'
+
+    PasswordResetRequest:
+      type: object
+      required: [email, otp, new_password]
+      properties:
+        email:
+          type: string
+          format: email
+        otp:
+          type: string
+          pattern: '^\d{6}$'
+        new_password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: Same strength rule as `UserCreate.password`.
+
+    MessageResponse:
+      type: object
+      required: [msg]
+      properties:
+        msg:
+          type: string
+
+    HTTPError:
+      type: object
+      required: [detail]
+      properties:
+        detail:
+          type: string
+      description: Standard FastAPI `HTTPException` shape, used for every non-2xx, non-422 error.
+
+    HTTPValidationError:
+      type: object
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            required: [loc, msg, type]
+            properties:
+              loc:
+                type: array
+                items:
+                  oneOf:
+                    - type: string
+                    - type: integer
+              msg:
+                type: string
+              type:
+                type: string
+      description: Standard FastAPI/Pydantic 422 shape (unchanged).

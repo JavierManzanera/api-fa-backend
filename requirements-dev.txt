@@ -1,0 +1,9 @@
+# Test-only dependencies (OBJ-000 Test Infrastructure Bootstrap).
+# Kept separate from requirements.txt per test-gap-analysis.md §1 recommendation
+# ("Esto debe ir a un requirements-dev.txt o extra [test], no implementada aqui").
+-r requirements.txt
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
+freezegun==1.5.5

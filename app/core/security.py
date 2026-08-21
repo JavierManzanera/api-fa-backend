@@ -10,6 +10,9 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = settings.ALGORITHM
 SECRET_KEY = settings.SECRET_KEY
 
+TOKEN_TYPE_ACCESS = "access"
+TOKEN_TYPE_REFRESH = "refresh"
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -23,7 +26,12 @@ def create_access_token(subject: Union[str, Any], expires_delta: Optional[timede
     expire = datetime.now(timezone.utc) + (
         expires_delta if expires_delta else timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    to_encode = {"exp": expire, "sub": str(subject)}
+    to_encode = {
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "sub": str(subject),
+        "type": TOKEN_TYPE_ACCESS,
+    }
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -31,18 +39,23 @@ def create_refresh_token(subject: Union[str, Any], expires_delta: Optional[timed
     expire = datetime.now(timezone.utc) + (
         expires_delta if expires_delta else timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     )
-    to_encode = {"exp": expire, "sub": str(subject), "refresh": True}
+    to_encode = {
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+        "sub": str(subject),
+        "type": TOKEN_TYPE_REFRESH,
+    }
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
 def verify_refresh_token(token: str) -> str:
     credentials_exception = HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Invalid refresh token",
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired refresh token",
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("refresh") is not True:
+        if payload.get("type") != TOKEN_TYPE_REFRESH:
             raise credentials_exception
         email: str = payload.get("sub")
         if email is None:
