@@ -68,6 +68,39 @@ breakdown, scope boundaries, and risk notes for `developer` are in
 `.ai-context/dependency_graph.md` under "OBJ-002 — Phase 2 (red phase)" —
 not duplicated here to avoid the two documents drifting out of sync.
 
+## OBJ-003 pass (2026-08-23, qa-engineer, red phase)
+
+No Gherkin/AC doc exists for OBJ-003 (backend/infra hardening, no
+business-analyst pass in this objective's agent chain) -- scenarios were
+derived directly from `docs/api/obj-003-design-notes.md`, with the
+derivation documented explicitly in each new file's own docstring (a new
+pattern for this project; every prior objective translated a Gherkin doc
+instead).
+
+Five new files, 47 tests, covering audit findings #7 (OTP hashed at rest),
+#8 (TLS to PostgreSQL), and #5 (timing side-channel on
+login/forgot-password/logout):
+- `tests/unit/test_otp_hashing.py` (11 tests) + `tests/api/
+  test_otp_hashing_integration.py` (5 tests) -- finding #7.
+- `tests/unit/test_database_ssl.py` (11 tests) + `tests/unit/
+  test_postgres_ssl_mode_startup.py` (11 tests) -- finding #8.
+- `tests/api/test_timing_side_channel.py` (9 tests) -- finding #5, plus the
+  OBJ-002 Gate 3 SAST fold-in on `/auth/logout`.
+
+**Required, non-optional factory fix landed in this pass** (design notes
+section 1.5): `tests/factories.py`'s `create_verification` now seeds
+`security.hash_otp(code)` instead of plaintext `code`. Full breakdown,
+including the **17 previously-green OBJ-001/OBJ-002 tests this deliberately
+turns red** (all `AttributeError`, all tracing to the single missing
+`app.core.security.hash_otp`, not broken tests), is in
+`.ai-context/dependency_graph.md`'s "OBJ-003 -- Phase 2 (red phase)"
+section -- not duplicated here to avoid the two documents drifting out of
+sync, same convention as the OBJ-002 pass above.
+
+Verified against the same throwaway self-provisioned Postgres pattern as
+every prior pass: full suite (`tests/unit` + `tests/api`, OBJ-000/001/002/003
+combined) -- **57 failed, 61 passed** (118 total).
+
 ## Layout
 
 - `tests/conftest.py` -- env-var bootstrap (must precede any `app.*`
@@ -107,6 +140,17 @@ not duplicated here to avoid the two documents drifting out of sync.
   spans OBJ-002 through OBJ-005 and was not re-scoped into this pass;
   only the 21 OBJ-001 Gherkin scenarios plus infra bootstrap were in
   scope.
+- **(OBJ-003) An actually-TLS-enabled Postgres integration test** --
+  `tests/unit/test_database_ssl.py` unit-tests `app.core.database`'s
+  mode-to-connect_args translation function directly; it does not stand up
+  a real TLS-terminated Postgres and connect to it. This sandbox's
+  throwaway `initdb`/`pg_ctl` Postgres has no TLS certs configured.
+- **(OBJ-003) Wall-clock timing measurement for finding #5** --
+  `tests/api/test_timing_side_channel.py` deliberately asserts only the
+  structural guarantee (call-count/mock assertions), per
+  `obj-003-design-notes.md` section 3's explicit instruction and this
+  project's own established Scenario-2.6 precedent that latency-based
+  assertions are flaky by construction.
 
 ## Risk notes for `developer`
 
@@ -124,3 +168,31 @@ not duplicated here to avoid the two documents drifting out of sync.
   `developer` wires these to settings with different defaults, update the
   constants at the top of `test_otp_lockout.py` and `test_rate_limit.py`
   accordingly.
+- **(OBJ-003) 17 previously-green tests are currently red, on purpose** --
+  see `.ai-context/dependency_graph.md`'s "OBJ-003 -- Phase 2 (red phase)"
+  section for the full list/explanation. All 17 error with the exact same
+  `AttributeError: module 'app.core.security' has no attribute 'hash_otp'`
+  (from `tests/factories.py`'s `create_verification`, required per
+  `obj-003-design-notes.md` section 1.5) -- implementing
+  `security.hash_otp`/`verify_otp_hash` and wiring `_check_and_consume_otp`
+  to use them should turn all 17 back green as a side effect, with no
+  changes needed to the 17 tests themselves.
+- **(OBJ-003) `tests/api/test_timing_side_channel.py`'s DB-call-count
+  assertions on `/auth/logout`** assume the `jti is None` no-op branch
+  performs its DB round trip through the SAME `AsyncSession` the `client`
+  fixture overrides `deps.get_db` with (same testability requirement
+  already established for the rate limiter in OBJ-001 -- see the risk note
+  above). If implemented via a separate session/engine, these specific
+  assertions will fail with an unexpected call count (0, not a raw
+  connection error, since the request itself still returns 204 either way)
+  rather than a clean pass -- treat that as the same class of testability
+  signal, not a broken test.
+- **(OBJ-003) `tests/api/test_otp_hashing_integration.py` depends on the
+  debug `print(...)` mock email sender staying in place** to recover the
+  real OTP value via `capsys` (no endpoint returns it). `OBJ-004`'s row in
+  `.ai-context/dependency_graph.md` lists "remove OTP debug print" as
+  in-scope. If OBJ-004 lands before this file is updated to use whatever
+  replaces it (a pluggable email-sender abstraction is OBJ-005 scope), this
+  file's `capsys`-based OTP capture will stop finding anything and every
+  test in it will fail for an unrelated reason -- flagged explicitly in the
+  file's own docstring too.

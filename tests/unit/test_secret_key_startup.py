@@ -37,6 +37,16 @@ BASE_ENV_FIELDS = {
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
     "REFRESH_TOKEN_EXPIRE_DAYS": "7",
+    # OBJ-003 finding #8 (obj-003-design-notes.md section 2.1): POSTGRES_SSL_MODE
+    # is a new required Settings field, no default. Added here PROACTIVELY
+    # (this file predates OBJ-003) so that once `developer` adds the field,
+    # these SECRET_KEY-focused tests keep testing SECRET_KEY specifically --
+    # without this line, every test below (including the "strong SECRET_KEY
+    # permits startup" ones) would start failing for the unrelated reason of
+    # a second missing required field, masking what's actually being tested.
+    # See tests/unit/test_postgres_ssl_mode_startup.py for the dedicated
+    # POSTGRES_SSL_MODE validation tests.
+    "POSTGRES_SSL_MODE": "disable",
 }
 
 

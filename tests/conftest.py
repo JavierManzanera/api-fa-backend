@@ -83,6 +83,20 @@ os.environ.setdefault(
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 os.environ.setdefault("REFRESH_TOKEN_EXPIRE_DAYS", "7")
+# OBJ-003 finding #8 (obj-003-design-notes.md section 2.2): POSTGRES_SSL_MODE
+# is a new required Settings field, no default (section 2.1). This line is
+# NOT here because any test DB *connection* needs it -- obj-003-design-
+# notes.md section 2.2 traced this precisely and confirmed db_engine below
+# builds its own independent engine against TEST_DATABASE_URL, never
+# app.core.database.engine (the only object POSTGRES_SSL_MODE affects), and
+# app.main's lifespan never runs under httpx.ASGITransport either. It's here
+# purely because Settings() is instantiated eagerly at app.core.config
+# IMPORT time (same singleton pattern that makes the SECRET_KEY block above
+# necessary) -- without this line, that import raises ValidationError for a
+# missing required field and the entire suite fails at collection, before
+# any test runs. "disable" (not "require"/"verify-full") because the
+# throwaway self-provisioned test Postgres has no TLS certs configured.
+os.environ.setdefault("POSTGRES_SSL_MODE", "disable")
 
 import pytest
 import pytest_asyncio

@@ -44,7 +44,7 @@ the user, not on any other objective's code. See its row below.
 | OBJ-000 | pytest + pytest-asyncio + httpx AsyncClient + test-DB override of `get_db` + user factory | qa-engineer | **Done (2026-08-21)** | None | test-gap-analysis.md §"Infraestructura base" |
 | OBJ-001 | Fix JWT type confusion (refresh usable as access token); OTP: `secrets`-based generation + attempt lockout + rate limiting; `SECRET_KEY` min-length/placeholder validation | business-analyst → solution-architect ∥ security-specialist → qa-engineer → developer | **CLOSED (2026-08-21) — Gate 3 unanimous PASS (qa-engineer, security-specialist, database-architect)** | OBJ-000 | audit-report.md #1, #2, #4 |
 | OBJ-002 | `/logout` + revocation store; refresh-token rotation + reuse detection; `token_version` invalidation on password reset | business-analyst → solution-architect → qa-engineer → developer | **CLOSED (2026-08-23) — Gate 3 unanimous PASS (qa-engineer, security-specialist, database-architect)** | OBJ-001 (done) | audit-report.md #3 |
-| OBJ-003 | Hash OTP at rest (HMAC); enforce TLS to PostgreSQL; constant-time login/forgot-password (timing side-channel) | solution-architect → database-architect ∥ qa-engineer → developer | Not Started | OBJ-001 (done) | audit-report.md #5, #7, #8 |
+| OBJ-003 | Hash OTP at rest (HMAC); enforce TLS to PostgreSQL; constant-time login/forgot-password (timing side-channel); **+picked up from OBJ-002 Gate 3 SAST review: latency-parity fix for the low-severity JWT-signature-validity timing leak on `/auth/logout`** | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED (2026-08-23) — Gate 3 unanimous PASS (qa-engineer, security-specialist, database-architect)** | OBJ-001 (done) | audit-report.md #5 (timing side-channel), #7 (OTP plaintext), #8 (no TLS) — **note:** this row's own citation previously listed these as #5=OTP/#7=TLS/#8=timing, transposed relative to `audit-report.md`'s actual numbering; corrected here, see `obj-003-design-notes.md` §0 |
 | OBJ-004 | CORS middleware; security headers (HSTS/X-Frame-Options/CSP/nosniff); gate `/docs`+`/redoc`+`/openapi.json` by `ENVIRONMENT`; structured auth-event logging; remove OTP debug `print`; **+backlog: rate limiter's `client_ip()` needs `X-Forwarded-For`/proxy support (MEDIUM, from OBJ-001 Gate 3)** | solution-architect → qa-engineer → developer | Not Started | OBJ-000 | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; enforce `is_verified` at login (policy: block or warn — confirm with user at this objective's gate 1); pluggable email-sender abstraction replacing the `print` mock | business-analyst → solution-architect → qa-engineer → developer | Not Started | OBJ-000 | audit-report.md #11 |
 | OBJ-006 | Replace `Base.metadata.create_all` with real Alembic migrations; pin `requirements.txt` + lockfile; `pip-audit`/`safety` in CI; separate DB roles (DDL vs. DML); **+backlog from OBJ-001 Gate 3: scheduled cleanup job for `rate_limit_hits` (unbounded growth, LOW), composite index `(email, purpose, expires_at)` on `verifications`, row-locking/atomic-UPDATE hardening for the OTP-lockout and rate-limit TOCTOU gaps (LOW, bounded overshoot only)**; **+backlog from OBJ-002 Gate 3: scheduled cleanup job for `refresh_sessions` (unbounded growth, LOW — retention floor must be ≥ `REFRESH_TOKEN_EXPIRE_DAYS`, not a short window like `rate_limit_hits`'s, to preserve reuse-detection integrity), explicit `ON DELETE CASCADE`/`ON DELETE SET NULL` FK behavior for `refresh_sessions.user_id`/`replaced_by` (currently undeclared, defaults to NO ACTION — must land before the cleanup job or purges will hit FK violations), composite index `(family_id, revoked_at)` on `refresh_sessions` (LOW, optional)** | database-architect → devops-engineer | Not Started | OBJ-000 | audit-report.md #12, #14 |
@@ -1232,6 +1232,899 @@ on the JWT-level check) are confirmed exactly as claimed — no discrepancy betw
 developer reported and what the code actually does. No new blocking findings. Awaiting
 `security-specialist` and `database-architect`'s independent Gate 3 passes before OBJ-002 closes
 fully (same pattern as OBJ-001).
+
+## OBJ-003 — Phase 1 deliverables (2026-08-23)
+
+No `business-analyst` pass for this objective — per the agent chain in the Active Objectives Status
+table (`solution-architect → database-architect ∥ qa-engineer → developer`), these are
+backend/infra hardening items with no user-facing story, so `solution-architect` led Phase 1
+directly against `docs/security/audit-report.md`.
+
+- **Finding-number correction (important — read before citing #5/#7/#8 elsewhere):** this row's
+  own citation of the three findings, and the task brief this pass was dispatched with, had
+  #5=OTP-plaintext/#7=TLS/#8=timing — a transposition relative to `audit-report.md`'s actual
+  numbering (**#5 = timing side-channel, #7 = OTP plaintext, #8 = no TLS**). The row above and this
+  entire section now use the audit report's real numbers. See `docs/api/obj-003-design-
+  notes.md` §0 for the full detail.
+- **Scope addition, picked up mid-pass, not in the original row:** `security-specialist`'s OBJ-002
+  Gate 3 SAST review (`docs/security/audit-report.md`, "Gate 3 — Verificación OBJ-002") found a new
+  LOW-severity timing side-channel on `POST /auth/logout` (leaks "is this a validly-signed JWT,
+  yes/no" via a DB-round-trip-vs-not latency difference — narrower than finding #5's original
+  user-enumeration signal) and explicitly recommended folding its fix into this objective rather
+  than opening a new one. Included in this pass's design (`obj-003-design-notes.md` §3.3) and now
+  reflected in the row above.
+- `docs/api/openapi.yaml` (solution-architect, bumped to `0.4.0-obj-003`) — no schema/status-code/
+  response-shape changes (all three findings are non-HTTP-surface or latency-only); description-
+  text updates only on `/auth/login`, `/auth/forgot-password`, `/auth/verify-otp`,
+  `/auth/reset-password`, and `/auth/logout`, plus the `info` block, all pointing at the design
+  notes for mechanism detail rather than encoding timing behavior in the contract itself.
+- `docs/api/obj-003-design-notes.md` (solution-architect) — full design for all three findings:
+  - **Finding #7 (OTP plaintext):** `Verification.code` becomes an HMAC-SHA256 hex digest, keyed by
+    a value derived from `SECRET_KEY` via `HMAC(SECRET_KEY, "api-fa-backend:otp-hmac:v1", sha256)`
+    (decision: derive, don't reuse `SECRET_KEY` raw, don't add a new required secret — alternative
+    with a dedicated new secret documented, not chosen). Verify-time comparison moves to
+    `hmac.compare_digest`. Column keeps its current name (`code`) for now — **schema change
+    surfaced for `database-architect`'s Phase 1 pass**, same "informal review, real migration in
+    OBJ-006" pattern as every table/column added since OBJ-001; naming (`code` vs. `code_hash`) is
+    an open bikeshed for that pass, not decided here. Key-rotation consequence for OBJ-001's still-
+    TBD Scenario 3.8 analyzed and found low-stakes (10-minute OTP TTL self-heals across any future
+    `SECRET_KEY` rotation) — does not block OBJ-003 on 3.8 being resolved. **Required, non-optional
+    follow-up flagged for `qa-engineer`:** `tests/factories.py`'s `create_verification` must hash
+    the seeded code before writing it to the DB, or every existing OTP test's "correct code"
+    assertion breaks silently once this lands.
+  - **Finding #8 (no TLS to Postgres):** new `POSTGRES_SSL_MODE` `Settings` field (`disable` |
+    `require` | `verify-full`, required, no default — matches the rest of `Settings`'s existing
+    convention), translated in `app/core/database.py` into an explicit `asyncpg` `ssl` connect_arg
+    (`False` / a permissive `SSLContext` / `ssl.create_default_context()` respectively — `asyncpg`'s
+    `ssl=True` already behaves like libpq's `verify-full`, not `require`, so the three modes are
+    built explicitly rather than passed through as a string). **Investigated and confirmed safe**
+    for the project's self-provisioned throwaway-Postgres test pattern: `tests/conftest.py`'s
+    `db_engine` fixture uses its own independent engine, never `app.core.database.engine` (confirmed
+    via the fixture's own docstring/comments), and `app.main`'s lifespan never runs under the test
+    suite either — so this change cannot break any existing test's DB *connection*. It does need one
+    new line in `tests/conftest.py`'s required-env-var bootstrap
+    (`os.environ.setdefault("POSTGRES_SSL_MODE", "disable")`), only because `Settings()` is
+    instantiated eagerly at import time regardless of which engine ends up used.
+  - **Finding #5 (timing side-channel):** `/login` and `/forgot-password` both gain a
+    structural guarantee — a bcrypt verify (real or against a precomputed dummy hash) executes
+    exactly once per request regardless of whether the target record exists — rather than chasing
+    exact wall-clock parity, which `docs/requirements/obj-001-critical-auth-hardening.md`'s own AC
+    (Scenario 2.6) already concedes isn't strictly enforceable. **Explicit testability guidance for
+    `qa-engineer`'s later Phase 2 pass:** assert this structurally (call-count/mock assertions on
+    `security.verify_password`), not via wall-clock timing measurement, which would be flaky by
+    construction. Also covers the OBJ-002 Gate 3 `/auth/logout` fold-in (§3.3 above) via an
+    equivalent-shaped no-op DB round trip in place of an early return.
+- **Two items explicitly routed to Gate 1 rather than decided unilaterally** (per task instructions
+  — both are genuine product/deployment tradeoffs, not architecture calls):
+  1. **TLS enforcement level** — configurable with a safe default + documented operator escape
+     hatch (recommended, avoids a premature dependency on OBJ-004's not-yet-built `ENVIRONMENT`
+     field and correctly handles same-host/Unix-socket deployment topologies) vs. hard-enforced with
+     no override at all, matching `SECRET_KEY`'s existing fail-closed precedent. See design notes
+     §2.3 for the full tradeoff.
+  2. **`/forgot-password`'s dummy-work mechanism for finding #5** — reuse the same bcrypt-dummy tax
+     unconditionally (recommended, matches the audit's literal fix text, adds a permanent
+     ~100-300ms latency cost to every legitimate call) vs. equalizing DB-query shape only (no added
+     latency, weaker and harder-to-maintain guarantee). See design notes §3.2.
+- **Gate 1: APPROVED (2026-08-23).** Both open decisions resolved, user picked the recommended
+  option in each case:
+  1. **TLS enforcement level**: configurable with a safe default + operator escape hatch
+     (`POSTGRES_SSL_MODE`, no hard-fail-closed like `SECRET_KEY`).
+  2. **`/forgot-password` dummy-work mechanism**: unconditional bcrypt-dummy tax on every call
+     (accepted the permanent ~100-300ms latency cost as the price of the stronger guarantee,
+     matching the audit's literal fix text).
+  - OBJ-003 is cleared to proceed: `database-architect` (informal schema review of the
+    `Verification.code` → HMAC-digest change) and `qa-engineer` (Phase 2 red-phase tests) against
+    `obj-003-design-notes.md` and `openapi.yaml` (v0.4.0-obj-003).
+
+## OBJ-003 — database-architect informal schema review (2026-08-23)
+
+Informal review only (OBJ-006 real Alembic migrations not started — the `code` value-shape change
+still lands via `Base.metadata.create_all`, same ordering wrinkle flagged for every table/column
+since OBJ-001). Scope: `Verification.code` plaintext → HMAC-SHA256 hex digest
+(`obj-003-design-notes.md` §1). No files changed by this pass; the naming decision below is a
+recommendation for `developer`'s Phase 3 to act on, not applied here.
+
+**ER diagram (unaffected tables omitted — only `VERIFICATION` changes; supersedes the `code` row
+in the OBJ-002 diagram above):**
+
+```mermaid
+erDiagram
+    VERIFICATION {
+        uuid id PK
+        string email "indexed (single-column)"
+        string code "was plaintext 6-digit OTP; becomes 64-char hex HMAC-SHA256 digest"
+        string purpose
+        int attempts "default 0"
+        timestamptz expires_at
+        timestamptz created_at "python-side default + server_default"
+    }
+```
+
+### 1. Column type/length — confirmed, no migration needed
+
+Read `app/models/verification.py:14` directly: `code: Mapped[str] = mapped_column(String,
+nullable=False)` — a bare `String` with **no length argument**. On the Postgres dialect SQLAlchemy
+compiles an unqualified `String` to an unbounded `VARCHAR` (no `(n)` constraint at the DDL level),
+not a fixed `String(6)` as the task brief's framing anticipated. So there is no truncation risk:
+a 64-character hex digest fits today's column exactly as the design notes claim (§1.4: "same
+column, same type... no length-constraint migration needed") — confirmed by reading the model,
+not taken on the design doc's word alone.
+
+**Minor, non-blocking, optional hardening worth flagging anyway** (this is exactly the class of
+thing that *would* silently break at runtime if the column *had* been fixed-length, so worth
+stating explicitly why it's fine here): an unbounded `String` also means the DB enforces no shape
+constraint at all on `code` — a future bug that wrote a truncated, empty, or oversized value
+wouldn't be caught at the schema level, only by the HMAC comparison always failing closed (safe,
+but silent). Two optional, purely defense-in-depth options for whenever `OBJ-006` writes the real
+migration (not urgent, not required for this objective):
+- Explicit `String(64)` — self-documents the expected digest length; note this is a *tightening*,
+  not today's requirement, since the column already accepts 64 chars unbounded.
+- A `CHECK` constraint enforcing `code ~ '^[0-9a-f]{64}$'` — stronger, catches a malformed digest
+  at write time instead of at the next verify-time comparison.
+
+Neither is a Gate blocker; today's unbounded `String` already accommodates the new digest shape
+correctly.
+
+### 2. Naming: `code` vs. `code_hash` — recommendation
+
+**Recommendation: rename to `code_hash`.** Rationale:
+- The column no longer stores anything resembling the value a user submits — it stores an
+  HMAC digest, which is not recoverable plaintext and not directly comparable without the derived
+  key. A name that still reads as `code` invites exactly the kind of mistake this finding exists to
+  prevent: a future contributor (on this template, or a downstream fork) assuming `verification.code`
+  is safe to log, display, or email, the way `RateLimitHit.ip`/`Verification.email` genuinely are
+  plain values. `code_hash` makes the column self-documenting at the one place (the model
+  definition) where a reader has the least other context.
+- **The rename's actual diff cost is smaller than it first looks — checked by grep, not assumed.**
+  Production references to the column are exactly two: `app/models/verification.py:14` (the
+  column definition itself) and `app/api/v1/endpoints/auth.py` lines 73 (`verification.code != otp`
+  → becomes the `verify_otp_hash` call either way) and 238 (`Verification(code=otp, ...)` →
+  `Verification(code_hash=security.hash_otp(otp), ...)`). `tests/factories.py:63/65`
+  (`create_verification`'s internal `Verification(code=code, ...)` construction) is the only other
+  production/test-support site. Critically, **none of the ~10 test call sites across
+  `test_otp_lockout.py`/`test_rate_limit.py`/`test_otp_resend_cooldown.py`/
+  `test_password_reset_invalidation.py`** need to change: they all call
+  `verification_factory(email=..., code="...")`, and `code` there is the **factory function's own
+  parameter name**, not the column name — the factory can keep accepting `code=` from callers while
+  writing it into `code_hash=` internally. So this rename is a 3-file, ~4-line change (model column,
+  two `auth.py` sites, one `tests/factories.py` site), not a codebase-wide rename. Low-stakes bikeshed,
+  cheap to resolve now rather than carry the ambiguity into `OBJ-006`'s real migration.
+- If the user prefers minimizing diff churn during this specific objective (design notes' stated
+  reason for defaulting to `code`), keeping the current name is not wrong either — this is a
+  readability/defense-in-depth call, not a correctness one, consistent with how this pass's other
+  findings are framed. Flagging the recommendation and its real (small) cost so the choice is
+  informed either way; not a Gate blocker regardless of which the user picks.
+
+### 3. Index impact — confirmed unaffected, no adjustment needed
+
+Read `app/models/verification.py` directly: the only index today is the single-column
+`email: Mapped[str] = mapped_column(String, index=True, ...)` — OBJ-001's recommended composite
+`(email, purpose, expires_at)` index (Gate 3, 2026-08-21) is still only illustrative DDL, not yet
+applied (tracked into `OBJ-006`, unchanged status). `code` was never part of either the current
+index or the OBJ-001-recommended composite one.
+
+Confirmed directly in `app/api/v1/endpoints/auth.py`'s `_check_and_consume_otp` (lines 61-68): the
+SQL filter is `Verification.email == email, Verification.purpose == RESET_PASSWORD_PURPOSE,
+Verification.expires_at > datetime.now(timezone.utc)` — three predicates, none of them `code`. The
+row is fetched first, then compared in Python at line 73 (`if verification.code != otp:`, soon
+`if not security.verify_otp_hash(otp, verification.code):`). Since `code`/`code_hash` is never a
+`WHERE` predicate or part of any index, widening its semantic content (6 digits → 64 hex chars)
+has **zero effect on index shape or query plan** — this pass's change and OBJ-001's still-pending
+composite-index recommendation are fully independent; neither blocks or motivates the other.
+
+### 4. HMAC comparison mechanism — confirmed as designed, no other schema-level concern
+
+Verified directly in `auth.py:73` (current code, pre-change) that lookup is by
+`(email, purpose, expires_at)` only, with `code` compared in Python after fetch — confirming the
+design notes' claim that the digest is never used as a lookup/index key, only as a
+constant-time-compared value against a freshly-computed digest of the user-submitted code
+(`hmac.compare_digest(hash_otp(submitted), stored_digest)` per the design notes' illustrative
+`verify_otp_hash`). This means:
+- **Collision behavior is genuinely irrelevant**, as the design notes state — an HMAC-SHA256
+  collision would only matter if the digest were used to *find* a row (i.e. `WHERE code_hash =
+  :submitted_hash`), where two different OTPs hashing to the same value could cross-authenticate.
+  That's not this code's shape: the row is already selected by `(email, purpose, expires_at)`
+  before any digest comparison happens, so a hypothetical collision could at most let a *different
+  6-digit string* pass verification for a *specific already-identified* row — a much narrower
+  concern than a lookup collision, and not increased by this change relative to today's plaintext
+  `!=` comparison, which has the analogous (astronomically smaller, since it's not a hash) property
+  of only ever comparing against one already-selected row's value.
+- No new schema-level attack surface: the digest is deterministic and keyed by a value derived from
+  `SECRET_KEY` (never stored in the DB itself, per design notes §1.1), so a raw dump of the
+  `verifications` table (finding #7's actual threat scenario) yields no usable OTP value without
+  also having `SECRET_KEY` — consistent with the design notes' own threat-scenario framing, and no
+  additional data-model concern beyond what's already reviewed above.
+- No FK, uniqueness, or nullability change of any kind — `code`/`code_hash` keeps its existing
+  `nullable=False`, no `unique=True` today (correct: a purpose-scoped column, not a natural key —
+  matches `RateLimitHit`'s posture in the OBJ-001 review), no reason to add one for a hashed value
+  either.
+
+### Minor/secondary observations
+- No backfill/migration script needed (design notes §1.4, confirmed independently by this pass —
+  see §1 above): any `Verification` row that exists at deploy time with a still-plaintext `code`
+  fails every future comparison and falls through to the existing generic-400/`attempts`-based
+  expiry path, self-resolving within the 10-minute OTP TTL. Same fail-closed-by-construction
+  pattern already used for OBJ-001's `type` claim and OBJ-002's `jti`/`ver` claims on pre-existing
+  tokens — no new pattern introduced here.
+- This finding is orthogonal to OBJ-001's still-pending composite-index recommendation and
+  OBJ-002's still-pending `refresh_sessions` composite-index/FK-`ON DELETE`/cleanup-job
+  recommendations — none of those change as a result of this pass, and this pass doesn't change
+  their priority or status. All remain tracked into `OBJ-006`.
+
+**Gate status for database-architect's piece: cleared, no blocking data-model issues.** The digest
+fits the existing unbounded `String` column with no migration required; the index and query-pattern
+review confirm `code`/`code_hash` was, and remains, outside any `WHERE`/index predicate, so this
+change cannot regress the `(email, purpose, expires_at)` query path either before or after OBJ-001's
+composite index eventually lands; the HMAC comparison mechanism matches the design notes exactly by
+direct code reading, not assumption. One naming recommendation (`code` → `code_hash`, real but
+small diff cost, non-blocking either way) and one optional defense-in-depth suggestion (explicit
+`String(64)` or a hex-shape `CHECK` constraint, cosmetic, deferred to `OBJ-006`) — neither should
+hold up OBJ-003's Gate 1/Phase 2 progression.
+
+## OBJ-003 — Phase 2 (red phase): Done (2026-08-23, qa-engineer)
+
+**No `business-analyst`/Gherkin doc exists for this objective** (per the agent chain in the Active
+Objectives Status table: `solution-architect → database-architect ∥ qa-engineer → developer` —
+backend/infra hardening, no user-facing story). This is a new pattern for this project's
+`qa-engineer` role — every prior objective (OBJ-001, OBJ-002) translated a business-analyst
+Gherkin doc into tests; here, scenarios were derived directly from `docs/api/obj-003-design-
+notes.md`'s design decisions (each decision implies at least one testable scenario), with that
+derivation **documented explicitly in each new file's own docstring** (which design-notes section
+each test/class traces to), matching the "traces to a specific scenario" rigor of OBJ-001/002's
+Gherkin-scenario citations, just sourced from a design doc instead of an AC doc. No
+`database-architect` OBJ-003 Phase 1 section existed yet in this file when this pass was authored
+(concurrent pass) — the HMAC construction was cross-checked directly against
+`obj-003-design-notes.md` §1.1 instead, as the task instructions allowed.
+
+**Five new files, 47 tests**, covering all three findings in scope:
+
+- `tests/unit/test_otp_hashing.py` (11 tests) — finding #7 (OTP hashed at rest), unit-level.
+  Traces to design notes §1: output-shape assertions (not plaintext, 64-char hex digest),
+  determinism/collision-resistance, the **exact** Option B key-derivation construction
+  (`HMAC(HMAC(SECRET_KEY, b"api-fa-backend:otp-hmac:v1", sha256).digest(), code,
+  sha256).hexdigest()` — independently re-implemented in the test file itself, not imported from
+  `app.core.security`, so this is a genuine check of the *chosen* construction and not a
+  tautology), a negative check that rejected Option A (raw-`SECRET_KEY`-as-HMAC-key, no
+  derivation) is NOT what's implemented, `verify_otp_hash` accept/reject/constant-time-comparison
+  (static `inspect.getsource` check for `compare_digest`, same technique as
+  `test_otp_generation.py`'s CSPRNG check, with the same rationale: a call-count test can't
+  distinguish "constant-time" from "bare `==`" without inspecting which primitive fired), and a
+  static check that `auth.py`'s `_check_and_consume_otp` was actually switched to
+  `verify_otp_hash` (not left doing `verification.code != otp`).
+- `tests/api/test_otp_hashing_integration.py` (5 tests) — finding #7, end-to-end through the
+  **real** `/auth/forgot-password` flow (task-mandated, not `tests/factories.py`'s
+  `verification_factory`, which bypasses the endpoint entirely). Per the task's explicit
+  constraint that no test may assume a known plaintext OTP value: the real OTP is recovered
+  out-of-band via `capsys` against the existing debug `print`-based mock email sender (the only
+  channel that exists today — flagged as an environment-dependent risk below, since OBJ-004 is
+  slated to remove that print statement). Structural assertions: stored value is NOT a plaintext
+  6-digit string, IS a 64-char hex digest, and **equals `security.hash_otp(the real otp)`**
+  exactly (ties storage directly to the app's own primitive, not just "looks like a hash").
+  Plus the task's explicit regression requirement: `/verify-otp` and `/reset-password` both still
+  succeed end-to-end with a real, hashed-at-rest OTP, and a wrong guess against a real hashed OTP
+  is still rejected 400 (lockout/attempt-accounting still functions under hashed storage).
+- `tests/unit/test_database_ssl.py` (11 tests) — finding #8 (TLS to PostgreSQL), unit-level, per
+  the task's explicit steer ("likely a unit test against `app/core/database.py`'s translation
+  function directly... rather than an integration test"). Targets
+  `app.core.database._build_ssl_connect_arg` (the function name from design notes §2.1's
+  illustrative code — flagged in the file docstring as an acceptable-to-rename contract if
+  `developer` picks a different name with equivalent behavior). The load-bearing test in this
+  file is `test_require_mode_disables_hostname_check_and_cert_verification` plus
+  `test_require_and_verify_full_produce_distinguishable_contexts`: design notes §2.1's whole
+  reason for existing is that `asyncpg`'s `ssl=True` already behaves like libpq's `verify-full`,
+  not `require` — a naive implementation that mapped both modes to a bare
+  `ssl.create_default_context()` would pass a weaker "returns an SSLContext" check but fail these
+  two specifically. **Explicit scope boundary** (matching this project's established
+  "explicitly out of scope" convention): no integration test against an actually-TLS-enabled
+  Postgres — this sandbox's throwaway `initdb`/`pg_ctl` instance has no TLS certs configured, and
+  `obj-003-design-notes.md` §2.2 already separately confirmed `app.core.database.engine` (the only
+  object this change touches) is never connected to anywhere in this test suite, so there is no
+  integration-level regression risk being left uncovered.
+- `tests/unit/test_postgres_ssl_mode_startup.py` (11 tests) — finding #8, the companion
+  "is the `Settings` field itself validated" half, at the same subprocess-per-case layer as
+  `test_secret_key_startup.py` (same rationale: `Settings()` is a module-level `lru_cache`d
+  singleton constructed at import time, so only a fresh subprocess per case can prove "does
+  constructing `Settings` raise"). Covers: all three valid modes permit startup (currently
+  vacuous passes — the field doesn't exist yet to validate, kept as forward-looking regression
+  anchors, same convention as `test_secret_key_startup.py`'s own docstring precedent), a missing
+  value blocks startup (required, no default, per design notes §2.1), and 7 parametrized
+  unrecognized/case-variant values (`""`, `"verify-ca"`, `"allow"`, `"prefer"`, `"REQUIRE"`,
+  `"Disable"`, `"yolo"`) all block startup — explicitly including case-variants of valid modes,
+  since design notes §2.1 does not specify case-insensitive matching for this field (unlike
+  `SECRET_KEY`'s placeholder blocklist, which explicitly is case-insensitive per
+  `obj-001-design-notes.md` §3).
+- `tests/api/test_timing_side_channel.py` (9 tests) — finding #5 (login/forgot-password) **plus**
+  the OBJ-002 Gate 3 SAST fold-in (`/auth/logout`), per design notes §3's **explicit,
+  task-mandated instruction to avoid wall-clock timing assertions entirely** — every assertion in
+  this file is a call-count/call-shape spy assertion (`unittest.mock.patch(...,
+  wraps=security.verify_password)` for login/forgot-password; `patch.object(db_session, "execute"
+  / "commit", wraps=...)` for logout), never a timer. `wraps=` keeps every call going through to
+  the real implementation (a spy, not a stub) — nothing about the mechanism under test is faked.
+  Covers: `/auth/login` with a nonexistent email must still call `verify_password` exactly once
+  (today: zero calls, Python short-circuits on `if not user or ...` — this **is** finding #5's
+  dominant signal) targeting `security.DUMMY_PASSWORD_HASH`; `/auth/login` with an existing
+  email/wrong password (kept as an already-green regression anchor — this branch is unchanged by
+  the fix); `/auth/forgot-password` calling `verify_password` exactly once in **both**
+  found/not-found branches per the Gate-1-approved Option A, always targeting
+  `DUMMY_PASSWORD_HASH` (never a real user's hash, since this endpoint never actually checks a
+  password); `/auth/logout` with a malformed token or a well-formed-wrong-type (access) token must
+  still cause exactly one `db.execute` + one `db.commit` call, matching the valid-`jti` branch's
+  already-correct call counts (kept as a third regression anchor).
+
+**Required, non-optional factory fix landed in this pass, as instructed** (design notes §1.5,
+task item 1): `tests/factories.py`'s `create_verification` now seeds `security.hash_otp(code)`
+into `Verification.code` instead of the plaintext `code` — required so the factory matches what
+the real `/forgot-password` flow will store once finding #7 lands; the plaintext code is still
+returned to the caller unchanged (needed for HTTP submission). Cross-checked against design notes
+§1.1's Option B construction directly (`HMAC(SECRET_KEY, "api-fa-backend:otp-hmac:v1",
+sha256)`-derived key, then `HMAC(derived_key, code, sha256).hexdigest()`), since no
+`database-architect` Phase 1 section existed in this file yet to cross-check against instead.
+
+**Also landed** (both required, non-optional, per the design notes/task):
+- `tests/conftest.py` — added `os.environ.setdefault("POSTGRES_SSL_MODE", "disable")` to the
+  required-`Settings`-fields bootstrap block, exactly as design notes §2.2 specified (needed
+  because `Settings()` constructs eagerly at import time regardless of which engine ever gets
+  used — confirmed this is not needed for the actual test DB *connection*, per §2.2's own
+  investigation, reproduced independently here).
+- `tests/unit/test_secret_key_startup.py` — **proactive fix, not requested in the task brief but
+  caught while authoring `test_postgres_ssl_mode_startup.py`**: added `"POSTGRES_SSL_MODE":
+  "disable"` to this file's own `BASE_ENV_FIELDS`. Without it, the moment `developer` adds the
+  new required field, every test in this file — including the ones proving a *strong* `SECRET_KEY`
+  permits startup — would start failing for an unrelated reason (a second missing required field),
+  masking the actual `SECRET_KEY` behavior under test. Fixed now rather than left as a landmine
+  for Phase 3.
+
+### Verification run and exact red/green counts
+
+Same self-provisioned throwaway Postgres pattern as every prior pass in this project: no Docker in
+this sandbox, `initdb`/`pg_ctl` from the already-installed `C:\Program Files\PostgreSQL\16\bin`
+binaries, own data directory under the OS scratchpad temp folder (`pgdata_obj003`), port 5433,
+`trust` auth, torn down with `pg_ctl stop -m fast` (confirmed via `pg_ctl status` → "no server
+running") immediately after the final verification run.
+
+**Full suite (`tests/unit` + `tests/api`, OBJ-000/001/002/003 combined): 57 failed, 61 passed**
+(118 total, up from OBJ-002's 71).
+
+**⚠ Correction to this pass's own task brief, flagged explicitly (honesty over the brief's stated
+expectation):** the task brief stated "all previously-passing tests (71 from OBJ-001+OBJ-002)
+should still pass." **This does not hold, and the reason is unavoidable, not a test-authoring
+mistake:**
+
+- **54 of the 71 previously-green tests remain green**, unaffected.
+- **17 of the 71 now fail — every one an `AttributeError: module 'app.core.security' has no
+  attribute 'hash_otp'`**, raised *inside* `tests/factories.py`'s `create_verification` itself,
+  before any HTTP call happens. This is a direct, mechanical consequence of the mandatory factory
+  fix above: every test that calls the `verification_factory` fixture — regardless of whether that
+  specific test's own assertions were about a *correct* code, a *wrong* code, an *expired* code, or
+  a *rate-limited* request — now errors at the factory call, because `security.hash_otp` doesn't
+  exist yet for the factory to call. This is **exactly the mirror image** of the exact regression
+  `obj-003-design-notes.md` §1.5 already warned about (it warned about the *opposite* ordering —
+  app landing the hash change before the factory is updated — but the underlying cause, "factory
+  and app must agree on `Verification.code`'s format," is identical either direction). Every one of
+  the 17 traces to this single missing piece, confirmed individually (see below) — none are broken
+  tests, malformed fixtures, or wrong assumptions about the current contract.
+  - `tests/api/test_otp_lockout.py` — all 6 tests (every test in the file uses
+    `verification_factory`).
+  - `tests/api/test_otp_resend_cooldown.py` — both 2 tests.
+  - `tests/api/test_password_reset_invalidation.py` — all 6 tests (via the shared `_reset_password`
+    helper, which calls `verification_factory`).
+  - `tests/api/test_rate_limit.py` — 3 of 5 tests (the two `/forgot-password` rate-limit tests
+    don't touch `verification_factory` and remain green; the three OTP/reset-password rate-limit
+    tests do).
+  - 6 + 2 + 6 + 3 = **17**, matching `57 failed − 40 new-test failures = 17` exactly (see below).
+- These 17 should all return to green, **with no changes needed to the 17 test files themselves**,
+  as a side effect of `developer` implementing `security.hash_otp`/`verify_otp_hash` and wiring
+  `_check_and_consume_otp` to use them (OBJ-003 finding #7's actual implementation) — confirmed by
+  design: once `hash_otp` exists, the factory's stored hash and the app's hash-based comparison
+  will agree again, the same way they implicitly agreed before this pass when both sides used
+  plaintext.
+
+**New-test breakdown (47 total): 40 red, 7 green.** The 7 green are deliberate, documented
+regression anchors for already-correct current behavior that must not regress (same convention as
+OBJ-001/002's own already-passing baseline tests): 2 in `test_otp_hashing_integration.py`
+(`/verify-otp`/`/reset-password` already work end-to-end with a real OTP — currently for the
+"official" reason of still-plaintext comparison, expected to keep passing for the *new*, correct
+reason once hashing lands), 3 in `test_timing_side_channel.py` (login-existing-user-wrong-password
+already calls `verify_password` once against the real hash; logout-valid-`jti` already does exactly
+one `execute`+`commit`), and 3 vacuous passes in `test_postgres_ssl_mode_startup.py`'s
+`TestValidSslModesPermitStartup` (currently pass only because the field doesn't exist yet to
+validate — not proof the field works, kept as forward-looking anchors per that file's own
+docstring). Every one of the 40 new-test failures was individually confirmed to fail for a specific
+missing-implementation reason (`AttributeError`/`ImportError` for the not-yet-existing
+`security.hash_otp`/`verify_otp_hash`/`app.core.database._build_ssl_connect_arg`, or a clean
+assertion mismatch for `verify_password` call counts / DB call counts / `Verification.code` shape)
+— spot-checked several directly via traceback inspection, not just eyeballed as "red."
+
+**Regression math, confirming the counts above are internally consistent:** 118 total − 71
+pre-existing = 47 new. 57 failed − 17 pre-existing-turned-red = 40 new-test failures. 61 passed − 54
+pre-existing-still-green = 7 new-test passes. 40 + 7 = 47 ✓.
+
+### Explicitly out of scope for this pass
+
+- **An actually-TLS-enabled Postgres integration test** (finding #8) — `test_database_ssl.py`
+  unit-tests the translation function only; no real TLS-terminated Postgres was stood up. Per the
+  task's own explicit scope guidance and `obj-003-design-notes.md` §2.2's confirmation that
+  `app.core.database.engine` is never connected to in this suite regardless.
+- **Wall-clock timing measurement** (finding #5) — deliberately never attempted anywhere in
+  `test_timing_side_channel.py`, per the task's explicit instruction and design notes §3.4's
+  guidance; only call-count/call-shape structural assertions.
+- **True concurrency/TOCTOU testing** of the OTP-hash comparison path — same established
+  convention as every prior pass in this project (OBJ-001 Scenario 2.7, OBJ-002 Scenario 2.3);
+  finding #7's hash swap doesn't change the existing lockout race's shape, already tracked toward
+  OBJ-006.
+- **`database-architect`'s own OBJ-003 Phase 1 deliverable** (the `Verification.code` naming
+  bikeshed — `code` vs. `code_hash` — and confirming the HMAC construction independently) — not
+  redone here; this pass cross-checked the construction directly against
+  `obj-003-design-notes.md` §1.1 instead, per the task's own fallback instruction, since no
+  `database-architect` section existed in this file yet when this pass was authored.
+
+### Risks/ambiguities flagged for `developer`
+
+1. **The 17-test regression above is expected and self-resolving** — do not treat it as a signal
+   that this pass's tests are wrong; implementing finding #7 should turn all 17 back green without
+   editing them.
+2. **`_build_ssl_connect_arg` function-name coupling** — `test_database_ssl.py` imports this exact
+   name from `app.core.database`, taken from design notes §2.1's illustrative code. If a different
+   name is chosen with equivalent behavior, update the import in that test file; that alone is not
+   a behavioral regression.
+3. **`test_timing_side_channel.py`'s logout DB-call-count assertions assume the `jti is None`
+   no-op branch uses the SAME overridable `AsyncSession`** the `client` fixture injects — same
+   testability requirement already established for OBJ-001's rate limiter. If implemented via a
+   separate session/engine, expect an unexpected call count (not a raw connection error, since the
+   endpoint itself still returns `204` regardless) rather than a clean pass.
+4. **`test_otp_hashing_integration.py` depends on the debug `print`-based mock email sender**
+   staying in place to recover the real OTP via `capsys` (no endpoint returns it). OBJ-004's row in
+   this file lists "remove OTP debug print" as in scope. If OBJ-004 lands before this file is
+   updated to use whatever replaces it, every test in this file will start failing for an unrelated
+   reason. Flagged in the file's own docstring too.
+5. **`/forgot-password`'s dummy-work target-hash assertions
+   (`test_forgot_password_always_targets_the_dummy_hash_never_a_real_one`) are somewhat
+   implementation-shape-coupled** — they assert `security.verify_password`'s second positional
+   argument equals `security.DUMMY_PASSWORD_HASH`, per design notes §3.1/3.2's illustrative call
+   signature. The call-COUNT assertions (the load-bearing structural guarantee) are robust to
+   implementation shape; the target-hash assertions are a secondary, more specific check of the
+   *exact* design notes mechanism — if `developer`'s real implementation achieves the same
+   constant-time guarantee via a differently-shaped call, the count assertions should still pass
+   even if a target-hash assertion needs adjusting.
+6. **Gate 1's TLS enforcement-level decision (Option A, safe default + operator escape hatch) means
+   `disable` is NOT rejected by `test_postgres_ssl_mode_startup.py`** — only genuinely unrecognized
+   values are. Don't "fix" that test file to reject `disable` if a future objective revisits the
+   Option A/B tradeoff; that would be a scope change requiring its own Gate 1 decision, not a test
+   bug.
+7. **`database-architect`'s concurrent OBJ-003 schema review (above) recommends renaming
+   `Verification.code` → `code_hash`, still an open/non-blocking bikeshed, not applied by any pass
+   so far.** This qa-engineer pass authored against the design notes' default (keep `code`) since
+   that review landed concurrently, after most of this pass's test files were already written.
+   `tests/api/test_otp_hashing_integration.py` reads `Verification.code`/`verification.code`
+   directly (both the SQLAlchemy filter and the attribute access) in four places. If `developer`
+   takes the rename, that file needs the same one-line-per-site update
+   `database-architect`'s review already scoped for `app/models/verification.py` and `auth.py`
+   (`code` → `code_hash`) — not counted in that review's own "3-file, ~4-line" estimate, since this
+   test file didn't exist yet when that estimate was written. `tests/factories.py`'s
+   `verification_factory(code=...)` call sites across the rest of the suite are unaffected either
+   way (as database-architect's review already notes: `code` there is the factory's own parameter
+   name, not the column name).
+
+**Gate 2: APPROVED (2026-08-23).** `developer` cleared to start Phase 3 implementation against the
+118-test suite (57 red expected — 40 new + 17 factory-fix-induced, both traced to specific missing
+pieces, not broken tests).
+
+## OBJ-003 — Phase 3 (green phase): Done (2026-08-23, developer)
+
+Baseline confirmed before any change: full suite run against a throwaway self-provisioned Postgres
+16 instance (same `initdb`/`pg_ctl` approach as every prior pass in this project — no Docker in
+this sandbox either; port 5433, `trust` auth, own data dir under the OS scratchpad temp folder,
+torn down with `pg_ctl stop -m fast`, confirmed stopped, after the final verification run)
+reproduced qa-engineer's exact **57 failed, 61 passed** (118 total). Final suite after
+implementation: **118 passed, 0 failed** (two consecutive full runs, foreground, back-to-back,
+~120s each, no flakiness observed).
+
+**Files touched:**
+- `app/core/security.py` —
+  - New `_OTP_HMAC_CONTEXT`/`_OTP_HMAC_KEY` module-level constants (computed once at import, per
+    `obj-003-design-notes.md` §1.1 Option B): `_OTP_HMAC_KEY = HMAC(SECRET_KEY,
+    b"api-fa-backend:otp-hmac:v1", sha256).digest()`.
+  - New `hash_otp(code: str) -> str` — `HMAC(_OTP_HMAC_KEY, code, sha256).hexdigest()`, the exact
+    construction `tests/unit/test_otp_hashing.py` independently re-implements and checks against
+    (not a tautology — verified: the test file computes its own expected digest rather than
+    importing this function's internals).
+  - New `verify_otp_hash(code: str, stored_hash: str) -> bool` — `hmac.compare_digest(hash_otp(code),
+    stored_hash)`; fails closed (returns `False`, never raises) against a malformed/still-plaintext
+    `stored_hash`, confirmed by `test_verify_otp_hash_rejects_a_plaintext_stored_value`.
+  - New `DUMMY_PASSWORD_HASH` module constant — `get_password_hash(secrets.token_urlsafe(32))`,
+    computed once at process startup (import time), per design notes §3.1.
+  - New `verify_password_or_dummy(plain_password, hashed_password: Optional[str]) -> bool` — always
+    calls `verify_password` exactly once; targets `hashed_password` when given, else
+    `DUMMY_PASSWORD_HASH`; unconditionally returns `False` when `hashed_password is None` regardless
+    of what the dummy verify itself returns (a random dummy secret could theoretically, astronomically
+    unlikely, "verify" against a caller-supplied string — the explicit `False` short-circuit closes
+    that even in principle).
+- `app/api/v1/endpoints/auth.py` —
+  - `_check_and_consume_otp`: `verification.code != otp` → `not
+    security.verify_otp_hash(otp, verification.code)`. No other change to the function's control
+    flow (attempt-increment/lockout logic untouched), per design notes §1.3.
+  - `/forgot-password`'s OTP-creation `Verification(code=otp, ...)` → `Verification(code=
+    security.hash_otp(otp), ...)`. The plaintext `otp` variable is unchanged everywhere else
+    (still what the mock email sender prints) — hashing happens only at the storage boundary.
+  - `/login`: restructured per design notes §3.1 — `db.execute`/lookup unchanged, but the
+    `if not user or not security.verify_password(...)` short-circuit is replaced with an
+    unconditional `security.verify_password_or_dummy(form_data.password, user.hashed_password if
+    user is not None else None)` call, decided on before the `if not credentials_valid` branch.
+    Status codes, messages, and the `is_active` check's position are byte-for-byte unchanged — pure
+    reordering, no contract change (matches `test_login_with_existing_email_wrong_password_...`'s
+    already-green regression-anchor expectation).
+  - `/forgot-password`: added an unconditional `security.verify_password_or_dummy(payload.email,
+    None)` call immediately after the user lookup and before the `if not user` branch — Gate-1-
+    approved Option A (design notes §3.2), fires in both found/not-found branches, always targets
+    `DUMMY_PASSWORD_HASH` (this endpoint never checks a real password).
+  - `/logout`: the `if jti is not None: ... await db.commit()` structure became `if jti is not
+    None: <revoke> else: await db.execute(select(1))` followed by an unconditional `await
+    db.commit()` outside the `if` — per design notes §3.3, both branches now make exactly one
+    `db.execute` call and one `db.commit` call.
+- `app/core/config.py` — new `POSTGRES_SSL_MODE: str` field (required, no default, matching every
+  other `POSTGRES_*` field's convention) plus `validate_postgres_ssl_mode` (`field_validator`,
+  raises `ValueError` at import/construction time for anything outside
+  `{"disable", "require", "verify-full"}` — lowercase-exact, no case-insensitive matching, per
+  design notes §2.1 and confirmed by `test_postgres_ssl_mode_startup.py`'s explicit case-variant
+  cases like `"Disable"`/`"REQUIRE"`).
+- `app/core/database.py` — new `_build_ssl_connect_arg(mode: str) -> bool | ssl.SSLContext`
+  (matches the exact function name `tests/unit/test_database_ssl.py` imports), implementing the
+  three modes exactly as design notes §2.1 specifies: `disable` → `False`; `require` → an
+  `ssl.create_default_context()` with `check_hostname = False` and `verify_mode = ssl.CERT_NONE`
+  explicitly set (the load-bearing distinction from `verify-full` — confirmed by
+  `test_require_mode_disables_hostname_check_and_cert_verification` and
+  `test_require_and_verify_full_produce_distinguishable_contexts`); `verify-full` → a bare
+  `ssl.create_default_context()` (default `CERT_REQUIRED` + hostname check). `engine = create_async_
+  engine(...)` now passes `connect_args={"ssl": _build_ssl_connect_arg(settings.POSTGRES_SSL_MODE)}`
+  — never omitted, per design notes §2.1's "behavior never depends on asyncpg's own
+  undocumented-to-us default."
+- `.env.example` — added `POSTGRES_SSL_MODE=verify-full` with a comment documenting the three
+  values and recommending `verify-full` beyond local dev, `disable` as the explicit local/test
+  opt-out — same convention as OBJ-001's `SECRET_KEY` comment addition.
+- No new entries in `requirements.txt` — `hmac`, `hashlib`, and `ssl` are all stdlib; no new
+  runtime dependency was needed for either finding #7 or finding #8.
+- No changes to `tests/factories.py`, `tests/conftest.py`, or any test file — qa-engineer's Phase 2
+  pass already landed every test-infra change this implementation needed (the `hash_otp` factory
+  fix, the `POSTGRES_SSL_MODE=disable` conftest/subprocess-test bootstrap lines). Confirmed by
+  re-reading all three files before starting implementation; none needed touching.
+
+**Design deviations from `obj-003-design-notes.md`: none.** Every construction (HMAC key
+derivation, `verify_otp_hash`'s `compare_digest`, the three SSL modes' exact `SSLContext` postures,
+`verify_password_or_dummy`'s call signature and unconditional-`False`-on-`None` behavior, the
+`/logout` no-op-plus-unconditional-commit restructure) was implemented exactly as the design notes'
+illustrative code specified, and the two Gate-1-resolved open decisions (TLS enforcement level =
+Option A; `/forgot-password` dummy-work mechanism = Option A) were both already locked in before
+this pass started — nothing left to decide independently. The one open bikeshed the design notes
+and `database-architect`'s review both flagged as non-blocking either way — renaming
+`Verification.code` → `code_hash` — was **not** taken: kept as `code`, matching the design notes'
+own stated default and avoiding an unscoped ripple into `tests/api/test_otp_hashing_integration.py`
+(which reads `Verification.code` directly in four places, per qa-engineer's own risk note #7) for a
+purely cosmetic, already-flagged-as-low-stakes rename. Still open for `OBJ-006`'s real migration
+pass if the team wants it later — not applied here, not silently dropped either (recorded in both
+design notes §1.4/§5 and this file's OBJ-003 database-architect review section already).
+
+**Verification detail — no test files were modified to make this pass, only implementation code.**
+Every one of the 57 baseline-red tests was traced individually to confirm it went green for the
+*designed* reason, not a coincidental one:
+- All 11 `test_otp_hashing.py` unit tests — including the negative check
+  (`test_hash_otp_does_not_reuse_raw_secret_key_as_the_hmac_key_directly`, confirming Option A
+  was NOT what got implemented) and the static-introspection checks
+  (`test_verify_otp_hash_uses_constant_time_comparison_not_bare_equality`,
+  `test_check_and_consume_otp_compares_via_hash_not_plain_equality`) — pass for the literal reason
+  their docstrings describe, not a weaker coincidental match.
+- All 5 `test_otp_hashing_integration.py` end-to-end tests pass using the real, `capsys`-recovered
+  OTP (never a hardcoded plaintext value) — confirms `hash_otp` is wired at the actual
+  `/forgot-password` storage boundary, not just unit-tested in isolation.
+- All 11 `test_database_ssl.py` unit tests pass, including the two most load-bearing ones
+  (`test_require_mode_disables_hostname_check_and_cert_verification`,
+  `test_require_and_verify_full_produce_distinguishable_contexts`) that specifically catch the
+  "naive `ssl.create_default_context()` for both `require` and `verify-full`" bug the design notes
+  warned about — confirmed by reading `_build_ssl_connect_arg`'s actual branches, not just the
+  green checkmark.
+- All 11 `test_postgres_ssl_mode_startup.py` subprocess tests pass, including all 7 unrecognized/
+  case-variant parametrized cases and the missing-field case — confirms the `field_validator`
+  genuinely blocks `Settings()` construction at import time, the same subprocess-per-case proof
+  technique as `test_secret_key_startup.py`.
+- All 9 `test_timing_side_channel.py` tests pass, including the three that were already green at
+  baseline (login-existing-user-wrong-password, logout-valid-jti) — confirmed unchanged/still
+  passing for the same reason, not accidentally broken and coincidentally still green via a
+  different path.
+- All 17 previously-green-turned-red tests (`test_otp_lockout.py`,
+  `test_otp_resend_cooldown.py`, `test_password_reset_invalidation.py`,
+  `test_rate_limit.py`) returned to green automatically once `security.hash_otp` existed, with
+  zero test-file edits — exactly as qa-engineer's Phase 2 pass predicted (design notes §1.5, this
+  file's own OBJ-003 Phase 2 section).
+- Full regression: all 54 previously-green, unaffected-by-OBJ-003 tests (OBJ-000/001/002) still
+  pass unchanged.
+
+## OBJ-003 — database-architect Gate 3 confirmation (2026-08-23)
+
+Confirmation pass only, re-checking Phase 3 implementation against the Phase 1 review above (see
+"OBJ-003 — database-architect informal schema review") — not a fresh review; the Phase 1 pass
+already covered column type/length, naming, index impact, and the HMAC comparison mechanism with
+no blocking issues.
+
+1. **`Verification.code` unchanged, as expected.** Read `app/models/verification.py:14` directly:
+   still `code: Mapped[str] = mapped_column(String, nullable=False)` — bare, unbounded `String`,
+   no length constraint, no rename. Matches developer's Phase 3 report: the `code` → `code_hash`
+   rename recommendation was deliberately not taken (kept the design notes' own stated default,
+   avoided an unscoped ripple into `test_otp_hashing_integration.py`'s four direct `Verification.code`
+   reads). The 64-char hex digest fits this column exactly as anticipated in Phase 1 — no migration
+   needed, confirmed again post-implementation.
+
+2. **`POSTGRES_SSL_MODE` confirmed non-schema.** Read `app/core/config.py:26-40,64-72`: it's a
+   required `str` field on `Settings(BaseSettings)` (pydantic-settings, env-var driven), not a
+   SQLAlchemy `Base`-derived model — no table, no column, no migration implication whatsoever. Read
+   `app/core/database.py:9-34`: `_build_ssl_connect_arg` is consumed only as `create_async_engine`'s
+   `connect_args={"ssl": ...}` — connection-layer only. `Base = declarative_base()` and every model
+   file are untouched by this. Confirmed no table anywhere references or is affected by this field.
+
+3. **No new column, table, or index beyond what Phase 1 anticipated.** Enumerated
+   `app/models/*.py`: `verification.py`, `rate_limit.py`, `refresh_session.py`, `user.py`,
+   `__init__.py` — the same four model tables reviewed at OBJ-001/OBJ-002 Gate 3, no new file.
+   `user.py` still has only `token_version` (OBJ-002) beyond its original columns; `rate_limit.py`
+   and `refresh_session.py` aren't in developer's OBJ-003 "files touched" list and read unchanged.
+   Confirms the expected answer: finding #8 (TLS) is connection-layer only, finding #5 (timing) is
+   pure application-logic (`verify_password_or_dummy`, `/logout`'s no-op-branch restructure) and
+   touches no data model at all. Only finding #7's value-shape change to `Verification.code`
+   (already covered by item 1) has any DB-adjacent footprint, and it required no migration.
+
+**Gate 3 status for database-architect's piece: CONFIRMED PASS.** Phase 3 implementation matches
+the Phase 1 review exactly — no schema drift, no missed migration, no new tables/columns/indexes.
+Nothing further needed from database-architect for OBJ-003's Gate 3.
+
+**What's left for Gate 3:**
+- `qa-engineer` — independent re-run and verification of the full 118-test suite, plus the same
+  "substantive, not tautological" audit applied to OBJ-001/OBJ-002's Gate 3 passes.
+- `security-specialist` — SAST/DAST pass confirming findings #5, #7, #8 are actually closed (not
+  just tests passing): specifically, (a) confirm the OTP-at-rest HMAC construction genuinely
+  provides key separation from `SECRET_KEY` as designed, (b) confirm `_build_ssl_connect_arg`'s
+  three modes produce the intended wire-level TLS behavior against a real TLS-terminated Postgres
+  (this pass, like qa-engineer's Phase 2, did **not** stand one up — `app.core.database.engine` is
+  provably never connected to in this test suite, per design notes §2.2, so this remains genuinely
+  untested end-to-end and is worth a real-Postgres-with-TLS-certs check outside this sandbox before
+  calling finding #8 fully closed in production), (c) confirm the `verify_password_or_dummy` timing
+  guarantee actually narrows the exploitable signal in practice (the call-count tests prove the
+  *structural* guarantee this design deliberately targets, not wall-clock parity — consistent with
+  the explicitly best-effort framing already established for finding #5 since OBJ-001).
+- `database-architect` — already completed an informal Phase 1 schema review (see "OBJ-003 —
+  database-architect informal schema review" above, 2026-08-23) confirming the `Verification.code`
+  value-shape change needs no migration and recommending (non-blocking) the `code` → `code_hash`
+  rename, which this pass explicitly did not take (see design-deviations note above). No further
+  database-architect action needed for Gate 3 unless the rename recommendation is revisited.
+- Test DB teardown note: this pass's throwaway Postgres 16 instance (`initdb`/`pg_ctl`, port 5433,
+  own data dir) was stopped after the final verification run (`pg_ctl stop -m fast`, confirmed via
+  `pg_ctl status` → "no server running"), same as every prior pass in this project.
+
+## OBJ-003 — security-specialist Gate 3 SAST verification (2026-08-23)
+
+Full detail in `docs/security/audit-report.md` §"Gate 3 — Verificación OBJ-003". Summary:
+
+- **#7 (OTP plaintext) — CERRADO.** Grep-confirmed no plaintext OTP write/compare remains anywhere
+  in `app/`. `hash_otp`'s key is genuinely derived (`hmac.new(SECRET_KEY, context, sha256)`, Option
+  B), not raw-`SECRET_KEY` reuse (Option A) — confirmed by direct read of
+  `app/core/security.py:26-29`. `verify_otp_hash` uses `hmac.compare_digest` (constant-time), fails
+  closed on malformed/legacy-plaintext stored values.
+- **#8 (no TLS to Postgres) — CERRADO**, plus one new LOW. `POSTGRES_SSL_MODE` fail-closed on
+  invalid values (`config.py:64-72`, same eager-singleton-import mechanism as `SECRET_KEY`).
+  `_build_ssl_connect_arg`'s three modes are genuinely distinguishable — `require` explicitly sets
+  `check_hostname=False`/`verify_mode=CERT_NONE` so it does **not** collapse into `verify-full`'s
+  guarantee (confirmed by reading `database.py:9-26`, not assumed from the design doc). **New LOW**:
+  `.env.example` documents `disable`/`verify-full` but never mentions `require`'s
+  encrypt-only/MITM-vulnerable nature — an operator reading only that file could mistake `require`
+  for a strong guarantee. Recommended fix: one line added to `.env.example`, tracked to OBJ-004 (no
+  new objective needed). Residual, non-blocking, already flagged by qa-engineer/developer: no
+  wire-level DAST check against a real TLS-terminated Postgres has been done in any pass of this
+  objective (sandbox has no TLS certs) — recommend a targeted check before any real deployment
+  relies on `require`/`verify-full`.
+- **#5 (timing side-channel) + `/auth/logout` fold-in — CERRADO.** `/login`: confirmed
+  `verify_password_or_dummy` fires unconditionally before any branch, with fully symmetric
+  query/bcrypt-call shape between found/not-found (no residual at all). `/forgot-password`: same
+  unconditional dummy call before the `if not user: return`; confirmed a bounded, already-Gate-1-
+  accepted query-count residual persists after that point (extra `Verification` SELECT/DELETE/
+  INSERT only on the found branch) — this is the deliberate Option A trade-off from
+  `obj-003-design-notes.md` §3.2 (bcrypt floor dominates), not a new gap. `/auth/logout`: confirmed
+  exactly one `db.execute` + one `db.commit` on both branches — genuinely symmetric now.
+- **Regression check (#1-#4): none found.** Read `app/api/deps.py` and the untouched portions of
+  `security.py`/`auth.py` directly — `type`/`ver` claim checks, OTP lockout/rate-limit logic, and
+  all three revocation paths (logout, reuse-detection, reset-password bulk-revoke) are byte-for-byte
+  unchanged by this pass's diff.
+- Neither new finding reopens the account-takeover chain; OWASP A02:2021 and A07:2021 both move to
+  PASS on this objective's three findings.
+
+**OBJ-003 Gate 3 security-specialist verdict: PASS.** `database-architect`'s Gate 3 confirmation is
+also done (concurrent pass, see "OBJ-003 — database-architect Gate 3 confirmation" above — CONFIRMED
+PASS). Awaiting only `qa-engineer`'s independent Gate 3 re-verification to close OBJ-003 unanimously,
+same convention as OBJ-001/OBJ-002.
+
+## OBJ-003 — qa-engineer independent Gate 3 verification (2026-08-23)
+
+**Verdict: PASS.** Independently reproduced the developer's result; the suite is substantive, not
+tautological; implementation matches `docs/api/openapi.yaml` (v0.4.0-obj-003) and
+`docs/api/obj-003-design-notes.md` line by line; zero regressions against the pre-OBJ-003 71. Both
+task-flagged load-bearing claims (OTP-hash-at-rest genuinely proven via the integration test, and
+`verify_password_or_dummy`/logout call-count parity genuinely proven via the timing-side-channel
+suite) checked by reading the actual assertions, not by trusting the green checkmark.
+
+**1. Own suite execution (not trusting developer's report).**
+Same self-provisioned throwaway Postgres 16 pattern as every prior pass in this project (no Docker
+in this sandbox): `initdb`/`pg_ctl` from `C:\Program Files\PostgreSQL\16\bin`, own data dir under
+the OS scratchpad temp folder (`pgdata_obj003_qagate3`), port 5433, `trust` auth, a `test`
+superuser role created and `api_fa_test` database owned by it (matching `TEST_DATABASE_URL`'s
+default), torn down after the run (`pg_ctl stop -m fast`, confirmed via `pg_ctl status` → "no
+server running"). Ran the full suite **twice, foreground, back to back**: both runs **118 passed, 0
+failed** (115.80s, then 110.01s), no flakiness. Matches developer's reported 118/118 exactly.
+
+**2. Substantive vs. trivial — read all 47 new OBJ-003 tests against the actual implementation
+diff, not just that they're green.**
+- `tests/unit/test_otp_hashing.py` (11 tests, confirmed by `--collect-only` count): the key-
+  derivation-construction test (`test_hash_otp_matches_the_designed_key_derivation_construction`)
+  independently re-implements Option B's HMAC construction inline rather than importing
+  `app.core.security`'s internals — genuinely a check of the *chosen* construction, confirmed by
+  reading `security.py:26-29`'s `_OTP_HMAC_KEY = hmac.new(settings.SECRET_KEY.encode("utf-8"),
+  _OTP_HMAC_CONTEXT, hashlib.sha256).digest()` byte-for-byte against the test's own
+  `_expected_hash_via_design_notes_construction`. The companion negative test
+  (`test_hash_otp_does_not_reuse_raw_secret_key_as_the_hmac_key_directly`, rejecting Option A) is not
+  redundant with it — I confirmed by hand that a hypothetical Option-A implementation would pass the
+  weaker "64-char hex digest" shape tests but fail both the positive construction-match test and this
+  negative one, so neither is a tautology. `test_verify_otp_hash_uses_constant_time_comparison_not_bare_equality`
+  and `test_check_and_consume_otp_compares_via_hash_not_plain_equality` are genuine static-source
+  checks (`inspect.getsource`), not behavioral — confirmed `security.py:79`'s `verify_otp_hash` body
+  literally contains `hmac.compare_digest`, and `auth.py:73`'s `_check_and_consume_otp` body contains
+  `verify_otp_hash` and no longer contains the string `verification.code != otp`.
+- `tests/unit/test_database_ssl.py` (11 tests) / `tests/unit/test_postgres_ssl_mode_startup.py` (11
+  tests): the two load-bearing SSL tests
+  (`test_require_mode_disables_hostname_check_and_cert_verification`,
+  `test_require_and_verify_full_produce_distinguishable_contexts`) specifically catch the "naive
+  `ssl.create_default_context()` for both `require` and `verify-full`" bug the design notes warn
+  about — confirmed by reading `database.py:19-25`: `require` explicitly sets `ctx.check_hostname =
+  False` and `ctx.verify_mode = ssl.CERT_NONE`, `verify-full` returns a bare
+  `ssl.create_default_context()` (default `CERT_REQUIRED` + hostname check) — genuinely
+  distinguishable postures, not a copy-pasted branch. `test_postgres_ssl_mode_startup.py`'s subprocess
+  technique (`sys.executable -c "import app.core.config"`, asserting exit code) is the same
+  proof-of-actual-import-time-raise technique already vetted at OBJ-001 Gate 3 for
+  `test_secret_key_startup.py` — confirmed `config.py:64-72`'s `validate_postgres_ssl_mode` raises
+  `ValueError` for anything outside the 3-value set, lowercase-exact (no case folding), matching the
+  7 case-variant/unrecognized parametrized cases exactly.
+- **Task item 3 (OTP-hashing integration test genuinely proves the DB row never contains
+  plaintext) — verified by reading the actual assertions in
+  `tests/api/test_otp_hashing_integration.py`, not just that they're green:**
+  `test_verification_code_column_is_not_a_plaintext_6_digit_otp` asserts `not
+  re.fullmatch(r"\d{6}", verification.code)` against the row fetched straight from the DB after a
+  real `/auth/forgot-password` call — a structural, not-a-known-plaintext-comparison check, exactly
+  per the task's own constraint that no test may assume it knows the OTP value ahead of time.
+  `test_verification_code_column_is_a_sha256_hex_digest_shape` confirms `len(verification.code) ==
+  64` and every char is hex. The strongest of the three,
+  `test_verification_code_column_equals_apps_own_hash_of_the_real_otp`, recovers the **real** OTP
+  out-of-band via `capsys` against the mock-email-sender print (never a hardcoded value — confirmed
+  by reading `_extract_otp_from_mock_email_output`'s regex against the actual
+  `[EMAIL MOCK]... OTP: {otp}` print format in `auth.py:264-266`) and asserts `verification.code ==
+  security.hash_otp(real_otp)` — this ties the DB row directly to the app's own hashing primitive,
+  the tightest possible proof short of asserting inequality with every possible plaintext value.
+  Together these three assertions leave no gap: not-plaintext-shaped, hash-shaped, AND
+  equal-to-the-app's-own-hash-of-the-real-value. Confirmed all three tests fetch the row via a fresh
+  `db_session.execute(select(Verification)...)` — a real DB round-trip, not a cached/mocked ORM
+  object — so this is a genuine proof about what Postgres actually stored, not what Python happened
+  to hold in memory.
+- **Task item 4 (timing-side-channel tests genuinely prove `verify_password_or_dummy`/equivalent
+  fires exactly once per request on found and not-found paths) — this task's specific ask, checked
+  by reading `tests/api/test_timing_side_channel.py`'s assertions against `auth.py`'s actual control
+  flow, not by trusting the green checkmark:**
+  - `/login`, nonexistent email: `patch("app.core.security.verify_password", wraps=...)` (a spy, not
+    a stub — `wraps=` means the real implementation still executes) asserts `mock_verify.call_count
+    == 1` and that the call's second positional arg (`call_args.args[1]`) equals
+    `security.DUMMY_PASSWORD_HASH`. Traced this against `auth.py:173-186`: `user =
+    result.scalars().first()` is unconditional (no early return), then `security.verify_password_or_dummy(
+    form_data.password, user.hashed_password if user is not None else None)` — a nonexistent `user`
+    means `hashed_password=None` is passed, `verify_password_or_dummy` (`security.py:49-60`) then
+    targets `DUMMY_PASSWORD_HASH` and calls the real `verify_password` exactly once inside itself.
+    Confirmed by hand that the OLD code (`if not user or not security.verify_password(...)`, a bare
+    `or` short-circuit) would have called `verify_password` **zero** times here — this is genuinely
+    the fix, not a coincidentally-passing assertion.
+  - `/login`, existing email/wrong password: same spy, asserts exactly 1 call targeting the real
+    user's `hashed_password` — this test was ALREADY passing pre-fix (documented as a regression
+    anchor in the Phase 2 notes) and still passes now; confirmed `auth.py`'s reordering didn't
+    accidentally add a second call or swap in the dummy hash for a real user.
+  - `/forgot-password`, both found and not-found branches: same spy pattern, asserts exactly 1 call
+    in **both** branches, always targeting `DUMMY_PASSWORD_HASH` (never a real hash — this endpoint
+    never checks a password at all). Traced `auth.py:220`: `security.verify_password_or_dummy(
+    payload.email, None)` sits unconditionally *before* the `if not user: return` branch at line
+    222 — so the call fires identically regardless of whether `user` was found, closing the
+    found/not-found asymmetry at the exact point the design notes specify (§3.2 Option A). This is
+    the single assertion set that actually distinguishes "fixed" from "looks fixed but the dummy
+    call was accidentally placed after the early return" — confirmed the call is genuinely before
+    the branch, not after it, by reading the line order directly.
+  - `/auth/logout`: `patch.object(db_session, "execute"/"commit", wraps=...)` on the SAME
+    `AsyncSession` the `client` fixture overrides `deps.get_db` with (the same testability
+    requirement already established for OBJ-001's rate limiter — confirmed this is satisfied, not a
+    silent connection-error risk). Asserts exactly 1 `execute` + 1 `commit` call for a valid `jti`
+    (baseline, already-green), a malformed token, AND a well-formed wrong-type (access) token.
+    Traced `auth.py:430-437`: the `if jti is not None: ... else: await db.execute(select(1))`
+    structure followed by an unconditional `await db.commit()` OUTSIDE the `if` genuinely makes both
+    branches call exactly one `execute` and one `commit`, matching the test's call-count assertions
+    exactly — confirmed by hand that the OLD code (an early `return` inside the `if jti is not
+    None:` block) would have produced 0 `execute`/0 `commit` calls for the two red-phase cases here.
+  None of the 9 tests in this file make a wall-clock timing assertion anywhere — confirmed by
+  reading the whole file; every assertion is a call-count or call-argument check on a `wraps=`
+  spy, exactly per the design notes' explicit anti-flakiness instruction.
+
+**3. Cross-check implementation against `docs/api/obj-003-design-notes.md` and `docs/api/openapi.yaml`
+(v0.4.0-obj-003) — read line by line, including both Gate-1-approved decisions:**
+- **TLS enforcement level (Gate-1 Option A — safe default + operator escape hatch).** Confirmed
+  `config.py:40`'s `POSTGRES_SSL_MODE: str` has no default and no hard-fail on `disable` specifically
+  (only genuinely-unrecognized values are rejected) — matches Option A exactly, not Option B's
+  hard-enforcement. `test_postgres_ssl_mode_startup.py`'s `TestValidSslModesPermitStartup` includes
+  `disable` in its 3 permitted-mode parametrization, confirming the test suite encodes the
+  Gate-1-approved choice, not the rejected one.
+- **`/forgot-password` dummy-work mechanism (Gate-1 Option A — unconditional bcrypt-dummy tax on
+  every call).** Confirmed `auth.py:220`'s `security.verify_password_or_dummy(payload.email, None)`
+  fires unconditionally on every call (found or not), not gated behind an `if not user:` check —
+  matches Option A, not Option B's DB-work-only-parity alternative. `test_forgot_password_with_existing_email_calls_verify_password_once`
+  and `test_forgot_password_with_nonexistent_email_calls_verify_password_once` both assert this
+  directly for both branches.
+- `openapi.yaml`'s `info.version: "0.4.0-obj-003"` and description-text-only diff confirmed by
+  `grep`: `/auth/login`, `/auth/forgot-password` gain finding-#5-closure notes; `/auth/verify-otp`,
+  `/auth/reset-password` gain finding-#7-informational notes; `/auth/logout` gains the §3.3 fold-in
+  note. No `components/schemas` change anywhere (confirmed — `Verification`/`code` were never part of
+  the public API surface, matching the design notes' own claim). No status-code or response-shape
+  diff anywhere in `auth.py` for any of the three findings, consistent with the spec's "latency-only
+  or non-HTTP-surface" framing.
+- `hash_otp`/`verify_otp_hash`'s exact construction, `_build_ssl_connect_arg`'s three branches, and
+  `verify_password_or_dummy`'s unconditional-`False`-on-`None` behavior all match the design notes'
+  illustrative code byte-for-byte (already traced above in items 2's per-file breakdown) — confirmed
+  no design deviation was silently taken, matching developer's own "design deviations: none" claim in
+  the Phase 3 notes.
+
+**4. Regression check — two independent signals, not just the aggregate pass count.**
+(a) Full 118/118 both runs — no failures anywhere in the pre-OBJ-003 71. (b) File modification
+timestamps (`ls -la --time-style=full-iso tests/api/ tests/unit/`): every one of the 9 pre-existing
+OBJ-001/OBJ-002 test files (`test_legacy_token_fail_closed.py`, `test_logout.py`,
+`test_me_endpoint.py`, `test_otp_lockout.py`, `test_otp_resend_cooldown.py`,
+`test_password_reset_invalidation.py`, `test_rate_limit.py`, `test_refresh_rotation.py`,
+`test_token_type_enforcement.py`, plus `test_otp_generation.py`/`test_security.py`) retains its
+original OBJ-001/OBJ-002-era timestamp — **none were edited during OBJ-003**, except
+`test_secret_key_startup.py`, whose only change is the documented one-line
+`"POSTGRES_SSL_MODE": "disable"` addition to `BASE_ENV_FIELDS` (confirmed via `grep` — exactly one
+line plus its explanatory comment, nothing else touched). This confirms the 17 tests that were
+transiently red during Phase 2 (the `hash_otp`-AttributeError group: all of `test_otp_lockout.py`,
+`test_otp_resend_cooldown.py`, `test_password_reset_invalidation.py`, 3 of 5 in
+`test_rate_limit.py`) are green again in this run for the documented *real* reason — the factory now
+successfully calls `security.hash_otp` (confirmed present and correctly wired, see `tests/factories.py:90`)
+— not because any of those 17 test files were quietly weakened to tolerate the change. `tests/conftest.py`'s
+`os.environ.setdefault("POSTGRES_SSL_MODE", "disable")` addition (confirmed present) is the other
+documented, required test-infra change, and nothing else in `conftest.py` was touched.
+
+**5. Both concurrent Gate 3 passes (`database-architect` CONFIRMED PASS, `security-specialist` PASS)
+reviewed — no discrepancy found with this pass's own findings.** `database-architect`'s confirmation
+that `Verification.code` stayed unrenamed and no new column/table/index landed matches what this
+pass independently observed while reading `auth.py`/`security.py`/`config.py`/`database.py`.
+`security-specialist`'s SAST verdict (all three findings CERRADO, one new non-blocking LOW re: `.env.example`
+not documenting `require`'s MITM-vulnerable posture, tracked to OBJ-004) is consistent with this
+pass's own line-by-line implementation read — no test-level evidence contradicts either finding.
+
+**Explicitly out of scope for this verification pass, per the established convention:**
+- Re-deriving the SAST/DAST security review or a real TLS-terminated-Postgres wire-level check
+  (`security-specialist`'s piece, already done above — genuinely unproven end-to-end in any pass of
+  this objective, consistent with everyone's own stated scope boundary; `app.core.database.engine`
+  is provably never connected to in this test suite per design notes §2.2, confirmed independently
+  during this pass too by re-reading `tests/conftest.py`'s `db_engine` fixture).
+- Re-deriving the schema review (`database-architect`'s piece, already done above).
+- True concurrency/TOCTOU testing of the OTP-hash comparison path — same established convention as
+  every prior pass in this project (OBJ-001 Scenario 2.7, OBJ-002 Scenario 2.3); finding #7's hash
+  swap doesn't change the existing lockout race's shape.
+- Wall-clock timing measurement — deliberately never attempted anywhere in this objective's tests,
+  confirmed above.
+
+**Conclusion:** Gate 3 qa-engineer sign-off: **PASS**. Suite is reproducible (118/118 twice, no
+flakiness), substantive (every one of the 47 new tests traced to real code paths, no mocked
+shortcuts beyond legitimate `wraps=` spies), and the implementation matches the spec and design
+notes line by line, including both Gate-1-approved decisions. The two task-flagged load-bearing
+claims — OTP never stored as plaintext, and the constant-time-guarantee call fires exactly once on
+every code path including `/auth/logout` — are genuinely proven by the tests' own assertions, not
+merely by a green checkmark. No new blocking findings.
+
+**OBJ-003 Gate 3 final verdict: PASS, unanimous across qa-engineer, security-specialist, and
+database-architect. Objective CLOSED.**
 
 ## Commits
 

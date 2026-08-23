@@ -9,12 +9,21 @@ info:
     OTP brute-force hardening, rate limiting), plus the OBJ-002 remediation surface
     (session/token lifecycle: `/auth/logout`, refresh-token rotation with reuse
     detection, and `token_version`-based invalidation on password reset — closes
-    audit finding #3). Config/startup-only requirements that have no HTTP surface
-    (e.g. SECRET_KEY validation) are intentionally NOT modeled here — see
-    `docs/api/obj-001-design-notes.md` §4. Session/token persistence design (the
-    `refresh_sessions` table, reuse-detection state machine, `token_version` claim)
-    is documented in `docs/api/obj-002-design-notes.md`, not repeated here.
-  version: "0.3.0-obj-002"
+    audit finding #3), plus the OBJ-003 remediation surface (data & transport
+    hardening: OTP hashed at rest, TLS to PostgreSQL, constant-time `/login` and
+    `/forgot-password` — closes audit findings #5, #7, #8). Config/startup-only or
+    transport-layer requirements that have no HTTP surface (SECRET_KEY validation,
+    PostgreSQL TLS enforcement) are intentionally NOT modeled here — see
+    `docs/api/obj-001-design-notes.md` §4 and `docs/api/obj-003-design-notes.md` §2.
+    Session/token persistence design (the `refresh_sessions` table, reuse-detection
+    state machine, `token_version` claim) is documented in
+    `docs/api/obj-002-design-notes.md`. **Note on finding numbers:** `obj-003-design-
+    notes.md` §0 documents a transposition between the finding numbers cited in
+    `dependency_graph.md`'s OBJ-003 row and `docs/security/audit-report.md`'s actual
+    numbering — #5/#7/#8 as used throughout this file follow the audit report's real
+    numbering (#5 = timing side-channel, #7 = OTP plaintext, #8 = no TLS), not the
+    dependency graph's (as-yet-uncorrected) citation.
+  version: "0.4.0-obj-003"
   contact:
     name: solution-architect (PRJ-003)
 servers:
@@ -72,8 +81,18 @@ paths:
       tags: [auth]
       summary: Exchange credentials for an access/refresh token pair
       description: >-
-        Timing side-channel on this endpoint is audit finding #5, scoped to OBJ-003 —
-        unaffected by this change. Both tokens returned here carry the explicit `type`
+        **Closed by OBJ-003 (finding #5).** Response codes and bodies below are
+        unchanged — the fix is internal-only: a bcrypt password verification is now
+        performed unconditionally on every call (against a precomputed dummy hash
+        when the submitted email has no matching user), so the presence/absence of a
+        matching account can no longer be inferred from whether a ~100-300ms bcrypt
+        call ran. This is a best-effort, structurally-guaranteed mitigation (the
+        expensive call always executes exactly once), not a response-time SLA —
+        deliberately not expressed as a timing constraint at this contract layer. See
+        `docs/api/obj-003-design-notes.md` §3.1 for the mechanism and §3.4 for how
+        this should be tested (call-count assertions, not wall-clock timing).
+
+        Both tokens returned here carry the explicit `type`
         claim from OBJ-001 (`access_token` decodes to `type=access`, `refresh_token`
         decodes to `type=refresh`).
 
@@ -137,6 +156,15 @@ paths:
         session-invalidation effect (bumping `token_version`, revoking active refresh
         sessions) happens on successful `/auth/reset-password` below, not here — an
         issued-but-unused OTP has no session-lifecycle side effect.
+
+        **Closed by OBJ-003 (finding #5, plus finding #7):** the same generic-200
+        response below is now also latency-equalized between the "email exists" and
+        "email doesn't exist" branches (see `obj-003-design-notes.md` §3.2 for the
+        chosen mechanism and the tradeoff it involved — not a response-shape change).
+        Separately, the OTP this endpoint creates is now stored hashed (HMAC-SHA256)
+        rather than in plaintext (finding #7) — an internal storage-format change with
+        no effect on this endpoint's request/response contract; see
+        `obj-003-design-notes.md` §1.
       requestBody:
         required: true
         content:
@@ -164,6 +192,12 @@ paths:
       tags: [auth]
       summary: Check an OTP without consuming it
       description: >-
+        **Changed by OBJ-003 (finding #7, informational only):** the submitted OTP is
+        now compared via a constant-time HMAC-digest check against a hashed value
+        rather than a plaintext equality check — an internal storage/comparison
+        change (`obj-003-design-notes.md` §1) with no effect on this endpoint's
+        request/response contract or the failure-accounting behavior described below.
+
         **Changed by OBJ-001 (finding #2).** Success/failure response shape is
         unchanged. What changes is failure accounting: every failed check (wrong code,
         expired code, or no live code at all) increments the `attempts` counter on the
@@ -212,6 +246,9 @@ paths:
       tags: [auth]
       summary: Consume an OTP to set a new password
       description: >-
+        **Changed by OBJ-003 (finding #7, informational only):** same constant-time
+        HMAC-digest comparison change as `/auth/verify-otp` above — no contract effect.
+
         **Changed by OBJ-001 (finding #2).** Same failure-accounting change as
         `/auth/verify-otp` (shared `attempts` counter, identical fail-closed 400,
         no distinct lockout signal). Success path (OTP consumed, `Verification` row
@@ -369,6 +406,14 @@ paths:
         **New endpoint, OBJ-002 (finding #3).** Closes the "no `/logout`" gap: a
         stolen refresh token could previously be used for its full natural lifetime
         (`REFRESH_TOKEN_EXPIRE_DAYS`) with no way to cut it off on demand.
+
+        **Changed by OBJ-003 (finding #5, informational only):** a low-severity
+        timing side-channel found during OBJ-002's Gate 3 SAST review (this endpoint
+        leaked, via response latency, whether the submitted string was a validly-
+        signed JWT — independent of session validity, which was already anti-oracled)
+        is closed by making the no-signature branch perform an equivalent-shaped
+        no-op DB round trip instead of returning immediately. Still always `204`, no
+        response-shape change. See `obj-003-design-notes.md` §3.3.
 
         **What it receives:** the refresh token in the request body — the same
         `RefreshTokenRequest` shape as `/auth/refresh` — **not** the access token

@@ -59,10 +59,35 @@ async def create_verification(
     Necessary because the OTP is never returned in any HTTP response (only
     ever "sent" via the print-based mock sender) -- there is no black-box
     way to learn a real, endpoint-issued OTP value from a test.
+
+    OBJ-003 (audit finding #7, obj-003-design-notes.md section 1.5):
+    `Verification.code` is now an HMAC-SHA256 hex digest, not plaintext --
+    this factory seeds `security.hash_otp(code)` into the column, not `code`
+    itself, so the stored row matches what the real /forgot-password flow
+    will store once finding #7 lands (module ownership: `hash_otp` lives in
+    app.core.security, the single source of truth for the HMAC
+    construction -- this factory must never reimplement it inline, or the
+    two could silently drift). The plaintext `code` is still returned to
+    the caller UNCHANGED (needed for the caller to submit it over HTTP --
+    see the docstring paragraph above); only the *stored* value changes.
+
+    REQUIRED, NOT OPTIONAL -- explicitly flagged by design notes section
+    1.5: "every existing OTP test... will otherwise silently start failing
+    every 'correct code' assertion... unless the factory is updated in the
+    same pass." This is that update.
+
+    KNOWN, DOCUMENTED RED-PHASE CONSEQUENCE (not a broken factory): until
+    `app.core.security.hash_otp` exists, this call raises AttributeError --
+    every test using the `verification_factory` fixture ERRORS (not a clean
+    assertion failure) until `developer` implements finding #7. See
+    .ai-context/dependency_graph.md's "OBJ-003 -- Phase 2 (red phase)"
+    section for the exact count of previously-green tests this affects and
+    why that number is real, not a sign this factory (or those tests) is
+    wrong.
     """
     verification = Verification(
         email=email,
-        code=code,
+        code=security.hash_otp(code),
         purpose=purpose,
         expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)),
     )

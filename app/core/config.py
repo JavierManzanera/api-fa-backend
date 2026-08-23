@@ -5,6 +5,12 @@ from functools import lru_cache
 
 MIN_SECRET_KEY_LENGTH = 32
 
+# OBJ-003 finding #8 (obj-003-design-notes.md section 2.1): the three
+# asyncpg-translatable TLS postures. Lowercase-exact, no case-insensitive
+# matching (unlike SECRET_KEY's placeholder blocklist) -- design notes
+# section 2.1 does not specify one for this field.
+_VALID_POSTGRES_SSL_MODES = {"disable", "require", "verify-full"}
+
 # Known-placeholder values that must never be used as a real SECRET_KEY,
 # compared case-insensitively (obj-001-design-notes.md section 3).
 _SECRET_KEY_BLOCKLIST = {
@@ -26,6 +32,12 @@ class Settings(BaseSettings):
     POSTGRES_SERVER: str
     POSTGRES_PORT: int
     POSTGRES_DB: str
+    # OBJ-003 finding #8 (obj-003-design-notes.md section 2.1): Gate 1
+    # APPROVED Option A (2026-08-23) -- configurable with a safe-default-
+    # free, operator-driven escape hatch, not hard-enforced like SECRET_KEY.
+    # Required, no default, matching every other POSTGRES_* field's existing
+    # convention -- every environment must say what it wants.
+    POSTGRES_SSL_MODE: str
 
     SECRET_KEY: str
     ALGORITHM: str
@@ -46,6 +58,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SECRET_KEY must not be a known placeholder value. Generate "
                 "one with secrets.token_urlsafe(64)."
+            )
+        return value
+
+    @field_validator("POSTGRES_SSL_MODE")
+    @classmethod
+    def validate_postgres_ssl_mode(cls, value: str) -> str:
+        if value not in _VALID_POSTGRES_SSL_MODES:
+            raise ValueError(
+                f"POSTGRES_SSL_MODE must be one of "
+                f"{sorted(_VALID_POSTGRES_SSL_MODES)}, got {value!r}."
             )
         return value
 

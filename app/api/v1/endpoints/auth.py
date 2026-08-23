@@ -70,7 +70,7 @@ async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str) -> Veri
     if verification is None:
         raise generic_error
 
-    if verification.code != otp:
+    if not security.verify_otp_hash(otp, verification.code):
         verification.attempts += 1
         if verification.attempts >= MAX_OTP_ATTEMPTS:
             verification.expires_at = datetime.now(timezone.utc)
@@ -173,7 +173,16 @@ async def login(
     result = await db.execute(select(User).filter(User.email == form_data.username))
     user = result.scalars().first()
 
-    if not user or not security.verify_password(form_data.password, user.hashed_password):
+    # OBJ-003 finding #5 (obj-003-design-notes.md section 3.1): always call
+    # verify_password_or_dummy, regardless of whether `user` exists -- a
+    # nonexistent email must not let this branch short-circuit past the
+    # bcrypt call (the dominant, most exploitable timing signal). Status
+    # code/message/is_active-check position are unchanged; this is purely a
+    # reordering so the bcrypt call always happens first.
+    credentials_valid = security.verify_password_or_dummy(
+        form_data.password, user.hashed_password if user is not None else None
+    )
+    if not credentials_valid:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect email or password")
 
     if not user.is_active:
@@ -201,6 +210,15 @@ async def forgot_password(
 
     result = await db.execute(select(User).filter(User.email == payload.email))
     user = result.scalars().first()
+
+    # OBJ-003 finding #5 (obj-003-design-notes.md section 3.2, Gate 1
+    # APPROVED Option A, 2026-08-23): unconditional bcrypt-dummy tax on
+    # EVERY call, found or not -- this endpoint never actually checks a
+    # password, so the target is always DUMMY_PASSWORD_HASH; the call exists
+    # purely for its constant-cost side effect, closing the found/not-found
+    # query-count asymmetry with the same mechanism /login uses.
+    security.verify_password_or_dummy(payload.email, None)
+
     if not user:
         return {"msg": GENERIC_OTP_SENT_MESSAGE}
 
@@ -235,7 +253,7 @@ async def forgot_password(
     otp = _generate_otp()
     verification = Verification(
         email=payload.email,
-        code=otp,
+        code=security.hash_otp(otp),
         purpose=RESET_PASSWORD_PURPOSE,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)
     )
@@ -402,10 +420,19 @@ async def logout(
     genuine schema failure (422), handled by FastAPI/Pydantic before this
     function ever runs.
     """
+    # OBJ-003 (obj-003-design-notes.md section 3.3, OBJ-002 Gate 3 SAST
+    # fold-in): the jti-is-None branch performs an equivalent-shaped no-op
+    # DB round trip instead of returning immediately, and commit() moves
+    # outside the `if` so it runs unconditionally in both branches -- this
+    # is what makes the two paths structurally identical (one db.execute
+    # call, one db.commit call, either way), closing the "is this a
+    # validly-signed JWT" timing signal.
     jti = _parse_jti(security.extract_jti_if_present(refresh_token))
     if jti is not None:
         await _revoke_active_sessions(
             db, RefreshSession.id == jti, now=datetime.now(timezone.utc)
         )
-        await db.commit()
+    else:
+        await db.execute(select(1))
+    await db.commit()
     return None

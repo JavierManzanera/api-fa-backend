@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any, Union
@@ -14,6 +17,17 @@ SECRET_KEY = settings.SECRET_KEY
 TOKEN_TYPE_ACCESS = "access"
 TOKEN_TYPE_REFRESH = "refresh"
 
+# OBJ-003 finding #7 (obj-003-design-notes.md section 1.1, Option B --
+# decided): the OTP-hashing HMAC key is DERIVED from SECRET_KEY, not the
+# raw SECRET_KEY bytes themselves -- this gives key separation (a
+# verifications-table dump alone can't forge/verify OTP hashes without also
+# having SECRET_KEY) without adding a new required secret. Computed once at
+# import time, not per-call.
+_OTP_HMAC_CONTEXT = b"api-fa-backend:otp-hmac:v1"
+_OTP_HMAC_KEY = hmac.new(
+    settings.SECRET_KEY.encode("utf-8"), _OTP_HMAC_CONTEXT, hashlib.sha256
+).digest()
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
@@ -21,6 +35,48 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
+
+
+# OBJ-003 finding #5 (obj-003-design-notes.md section 3.1): a precomputed
+# dummy bcrypt hash, computed once at process startup (not per-request), so
+# verify_password_or_dummy always has a real bcrypt target to verify against
+# even when no matching user/record exists. Deriving it via
+# get_password_hash(...) keeps it automatically consistent with whatever
+# bcrypt cost factor passlib is configured with.
+DUMMY_PASSWORD_HASH = get_password_hash(secrets.token_urlsafe(32))
+
+
+def verify_password_or_dummy(plain_password: str, hashed_password: Optional[str]) -> bool:
+    """OBJ-003 finding #5 (obj-003-design-notes.md section 3.1): always
+    performs exactly ONE bcrypt verify call, regardless of whether
+    `hashed_password` is known -- this is the structural guarantee that
+    closes the timing side-channel (a nonexistent user must not let the
+    caller short-circuit past the expensive bcrypt call). When
+    `hashed_password` is None, verifies against DUMMY_PASSWORD_HASH instead
+    (purely for its constant-cost side effect) and unconditionally returns
+    False -- the dummy verify's own boolean result is never trusted."""
+    target = hashed_password if hashed_password is not None else DUMMY_PASSWORD_HASH
+    result = verify_password(plain_password, target)
+    return result if hashed_password is not None else False
+
+
+def hash_otp(code: str) -> str:
+    """OBJ-003 finding #7 (obj-003-design-notes.md section 1.1, Option B):
+    HMAC-SHA256 of `code`, keyed by _OTP_HMAC_KEY (itself derived from
+    SECRET_KEY, never the raw SECRET_KEY bytes) -- returns a 64-char hex
+    digest. Single source of truth for OTP-at-rest hashing; every write
+    site (app/api/v1/endpoints/auth.py, tests/factories.py) must call this
+    rather than reimplementing the construction inline."""
+    return hmac.new(_OTP_HMAC_KEY, code.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_otp_hash(code: str, stored_hash: str) -> bool:
+    """Constant-time comparison (hmac.compare_digest) of a freshly-hashed
+    `code` against `stored_hash` -- closes a secondary digest-comparison
+    timing concern as a side effect of finding #7's storage-format fix
+    (obj-003-design-notes.md section 1.3). Fails closed (returns False,
+    never raises) against a malformed/still-plaintext `stored_hash`."""
+    return hmac.compare_digest(hash_otp(code), stored_hash)
 
 
 def create_access_token(
