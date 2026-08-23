@@ -38,6 +38,14 @@ async def get_current_user(
     user = result.scalars().first()
     if user is None:
         raise credentials_exception
+
+    # OBJ-002 (design notes section 3): a missing `ver` claim (pre-OBJ-002
+    # token) compares as None != <int>, so it fails closed the same as a
+    # genuine mismatch -- no special-casing needed. Piggybacks on the User
+    # row this function already had to load, no extra query.
+    if payload.get("ver") != user.token_version:
+        raise credentials_exception
+
     return user
 
 

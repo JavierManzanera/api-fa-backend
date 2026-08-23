@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from app.core.config import settings
 from app.api.v1.router import api_router
 from app.core.database import engine, Base
-from app.models import user, verification, rate_limit
+from app.models import user, verification, rate_limit, refresh_session
 import uvicorn
 
 

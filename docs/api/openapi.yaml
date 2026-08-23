@@ -6,10 +6,15 @@ info:
     This file is the full source of truth for all HTTP-facing behavior — it documents
     both the endpoints already implemented (register/login/forgot-password/verify-otp/
     reset-password/refresh) and the OBJ-001 remediation surface (JWT type confusion,
-    OTP brute-force hardening, rate limiting). Config/startup-only requirements that
-    have no HTTP surface (e.g. SECRET_KEY validation) are intentionally NOT modeled
-    here — see `docs/api/obj-001-design-notes.md` §4.
-  version: "0.2.0-obj-001"
+    OTP brute-force hardening, rate limiting), plus the OBJ-002 remediation surface
+    (session/token lifecycle: `/auth/logout`, refresh-token rotation with reuse
+    detection, and `token_version`-based invalidation on password reset — closes
+    audit finding #3). Config/startup-only requirements that have no HTTP surface
+    (e.g. SECRET_KEY validation) are intentionally NOT modeled here — see
+    `docs/api/obj-001-design-notes.md` §4. Session/token persistence design (the
+    `refresh_sessions` table, reuse-detection state machine, `token_version` claim)
+    is documented in `docs/api/obj-002-design-notes.md`, not repeated here.
+  version: "0.3.0-obj-002"
   contact:
     name: solution-architect (PRJ-003)
 servers:
@@ -20,8 +25,10 @@ tags:
   - name: auth
     description: >-
       Owns all identity/credential/session data for this service (users, verification
-      codes, tokens). No other module in this template owns auth-related persistence —
-      any forked project extending this template should keep it that way.
+      codes, tokens, and — as of OBJ-002 — the `refresh_sessions` table tracking
+      active/rotated/revoked refresh-token lineage). No other module in this template
+      owns auth-related persistence — any forked project extending this template
+      should keep it that way.
 
 security: []  # default: unauthenticated. Individual operations opt into `bearerAuth`.
 
@@ -65,11 +72,21 @@ paths:
       tags: [auth]
       summary: Exchange credentials for an access/refresh token pair
       description: >-
-        Unchanged by OBJ-001 (timing side-channel on this endpoint is audit finding #5,
-        scoped to OBJ-003). Both tokens returned here now carry the explicit `type`
-        claim described in the design notes — `access_token` decodes to `type=access`,
-        `refresh_token` decodes to `type=refresh`. This is the only behavioral change
-        on this endpoint for OBJ-001; request/response shape is unchanged.
+        Timing side-channel on this endpoint is audit finding #5, scoped to OBJ-003 —
+        unaffected by this change. Both tokens returned here carry the explicit `type`
+        claim from OBJ-001 (`access_token` decodes to `type=access`, `refresh_token`
+        decodes to `type=refresh`).
+
+        **Changed by OBJ-002 (finding #3).** Both tokens now also carry a `ver` claim
+        set to the user's current `token_version` at issuance time (see
+        `obj-002-design-notes.md` §3) — this is what lets a later password reset
+        invalidate every token issued before it. The refresh token additionally
+        carries a `jti` claim (a fresh UUID) that identifies a new row this call
+        inserts into the `refresh_sessions` table, seeding a new token "family" — see
+        `obj-002-design-notes.md` §1-2 for the persistence/rotation model that
+        `/auth/refresh` and `/auth/logout` build on. Request/response shape is
+        unchanged; only JWT payload contents and this new persistent side effect are
+        new.
       requestBody:
         required: true
         content:
@@ -115,6 +132,11 @@ paths:
           existence oracle this endpoint already avoids.
         - OTP generation moves from `random.choices` to `secrets`-based generation
           (implementation detail, not a contract change — see design notes §3).
+
+        **Note (OBJ-002 boundary):** this endpoint only *issues* the OTP. The actual
+        session-invalidation effect (bumping `token_version`, revoking active refresh
+        sessions) happens on successful `/auth/reset-password` below, not here — an
+        issued-but-unused OTP has no session-lifecycle side effect.
       requestBody:
         required: true
         content:
@@ -194,6 +216,21 @@ paths:
         `/auth/verify-otp` (shared `attempts` counter, identical fail-closed 400,
         no distinct lockout signal). Success path (OTP consumed, `Verification` row
         deleted) is unchanged.
+
+        **Changed by OBJ-002 (finding #3).** On success, in the same transaction as
+        the password update: `User.token_version` is incremented by 1, and every
+        currently-active (`revoked_at IS NULL`) row in `refresh_sessions` for this
+        user is marked revoked. Effect: every access token and every refresh token
+        issued before this moment stops working — access tokens fail their `ver`
+        check on their next use (no wait for natural expiry beyond that next request),
+        and refresh tokens fail both the `ver` check *and* the session-revoked check
+        on their next `/auth/refresh` call, whichever runs first. This closes audit
+        finding #3's core scenario: a refresh token stolen before a suspicious
+        password reset no longer survives the reset. See `obj-002-design-notes.md` §3
+        for the full claim-comparison design and §2 for why reset also bulk-revokes
+        `refresh_sessions` rather than relying on `token_version` alone. Response
+        shape (`msg`) is unchanged — this is a same-transaction side effect, not a
+        new field in the 200 body.
       requestBody:
         required: true
         content:
@@ -239,32 +276,56 @@ paths:
     post:
       operationId: refreshAccessToken
       tags: [auth]
-      summary: Exchange a valid refresh token for a new access token
+      summary: Exchange a valid refresh token for a new access/refresh token pair
       description: >-
-        **Changed by OBJ-001 (finding #1).** `verify_refresh_token` now enforces
-        `type == "refresh"` (previously only checked the legacy `refresh: true` claim,
-        which is being replaced — see design notes §1). Rejection status changes from
-        `400` to `401` for all token-validity failures (bad signature, expired,
-        malformed, **or wrong `type`** — e.g. an access token submitted here) to align
-        with the rest of the auth-failure surface. The "valid token, but user
-        inactive/deleted" branch is unchanged and stays `400` (a business-state error,
+        **Changed by OBJ-001 (finding #1).** `verify_refresh_token` enforces
+        `type == "refresh"`. Rejection status is `401` for all token-validity
+        failures (bad signature, expired, malformed, or wrong `type`). The "valid
+        token, but user inactive/deleted" branch stays `400` (a business-state error,
         not a credential-validation failure).
+
+        **Changed by OBJ-002 (finding #3) — refresh tokens now rotate, with reuse
+        detection.** Every successful call:
+
+        1. Looks up the submitted token's `jti` claim in the `refresh_sessions`
+           table. No row found (includes any pre-OBJ-002 token, which has no `jti`
+           at all) → `401`.
+        2. Row found but `revoked_at IS NOT NULL` → **reuse detected**: this exact
+           token was already exchanged once before and is being replayed. The
+           entire token *family* (every row sharing its `family_id`, i.e. every
+           descendant issued by prior rotations of the same original login) is
+           revoked, and the call fails `401` — same generic message as any other
+           failure here, no distinguishing signal. See `obj-002-design-notes.md` §2
+           for the full state machine and the rationale for revoking the whole
+           family rather than just this token.
+        3. Row found, not revoked, but past its own `expires_at` → `401` (ordinary
+           expiry, not treated as reuse — no family-wide revocation).
+        4. Row valid → the submitted token's `payload.ver` is compared against the
+           user's current `token_version` (loaded from the same `User` row this
+           handler already fetches for the inactive/not-found check — no extra
+           query). Mismatch → `401` (this is the password-reset invalidation path,
+           `obj-002-design-notes.md` §3).
+        5. All checks pass → the current session row is marked revoked
+           (`replaced_by` set to the new row's id), a **new** `refresh_sessions` row
+           is inserted (same `family_id`, new `jti`), and a **new** access token +
+           **new** refresh token are issued and returned. The submitted refresh
+           token cannot be used again after this call succeeds.
+
+        Unlike the pre-OBJ-002 contract, the `refresh_token` in the response is
+        **never** the same string that was submitted — callers must persist the
+        rotated token and discard the old one immediately.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              type: object
-              required: [refresh_token]
-              properties:
-                refresh_token:
-                  type: string
+              $ref: '#/components/schemas/RefreshTokenRequest'
       responses:
         '200':
           description: >-
-            New access token issued. `refresh_token` in the response is currently the
-            same token that was submitted (no rotation yet — rotation + reuse
-            detection is OBJ-002, out of scope here).
+            New access token **and** new (rotated) refresh token issued. The
+            submitted refresh token is now revoked and cannot be reused — a repeat
+            call with it will be treated as reuse detection (see above).
           content:
             application/json:
               schema:
@@ -279,14 +340,85 @@ paths:
                 detail: "User inactive or not found"
         '401':
           description: >-
-            Token is malformed, has an invalid signature, is expired, or has
-            `type != "refresh"` (includes an access token being replayed here).
+            Token is malformed, has an invalid signature, is expired, has
+            `type != "refresh"` (includes an access token being replayed here), has
+            no matching (or an already-revoked) `refresh_sessions` row — including
+            reuse-detected replays and pre-OBJ-002 legacy tokens with no `jti` — or
+            has a `ver` claim that no longer matches the user's current
+            `token_version` (invalidated by an intervening password reset). All
+            causes share this single generic message and status code — deliberately
+            indistinguishable, consistent with this service's existing anti-oracle
+            design for OTP/lockout failures. Server-side structured logging (OBJ-004
+            scope) SHOULD still record which specific cause fired, for incident
+            response.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPError'
               example:
                 detail: "Invalid or expired refresh token"
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Revoke a refresh token's session (end that login session)
+      description: >-
+        **New endpoint, OBJ-002 (finding #3).** Closes the "no `/logout`" gap: a
+        stolen refresh token could previously be used for its full natural lifetime
+        (`REFRESH_TOKEN_EXPIRE_DAYS`) with no way to cut it off on demand.
+
+        **What it receives:** the refresh token in the request body — the same
+        `RefreshTokenRequest` shape as `/auth/refresh` — **not** the access token
+        from the `Authorization` header. Two reasons: (1) nothing is tracked
+        per-access-token (access tokens stay fully stateless for latency —
+        `obj-002-design-notes.md` §3), so there is no server-side record an access
+        token alone could target for revocation; (2) requiring only the refresh
+        token lets a client log out even when its access token has already expired
+        (the common case of a backgrounded app), matching `/auth/refresh`'s own
+        auth model of "possession of the refresh token is the credential," with no
+        separate bearer-header requirement layered on top.
+
+        **What it invalidates:** exactly one `refresh_sessions` row — the one whose
+        `id` matches the submitted token's `jti` claim — by setting `revoked_at`.
+        This does **not** revoke the rest of that token's family (unlike reuse
+        detection on `/auth/refresh`): logout is a deliberate, expected client
+        action, not an attack signal, so a double-submitted or retried logout call
+        must stay a no-op, not cascade into revoking sibling sessions.
+
+        **What it does NOT invalidate:** the caller's current access token, if any.
+        Per the stateless-access-token design, an already-issued access token
+        remains usable until its own short natural expiry
+        (`ACCESS_TOKEN_EXPIRE_MINUTES`) even after logout — this is an accepted,
+        explicitly-documented trade-off of not backing access tokens with a
+        revocation table (see `obj-002-design-notes.md` §5 open-decisions note).
+
+        **Idempotency — always `204`, deliberately, for any well-formed request
+        body:** an already-revoked token, an expired token, a token with no
+        matching `refresh_sessions` row (e.g. a pre-OBJ-002 legacy token with no
+        `jti`), a malformed/garbage JWT string, or a well-formed JWT of the wrong
+        `type` all produce the **same** `204` — because in every one of those cases
+        the caller's desired end state ("this token cannot be used to get a new
+        session") already holds. Only a request body that fails schema validation
+        (missing `refresh_token` field, wrong JSON shape) returns `422`. The
+        signature is still cryptographically verified before any DB write is
+        attempted — an unverified/attacker-controlled `jti` is never used to look up
+        or revoke a row, which would otherwise let a forged token be used to log out
+        an arbitrary other session by guessing its id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenRequest'
+      responses:
+        '204':
+          description: >-
+            The session is now revoked (or already was, already expired, never
+            existed, or the token was malformed/wrong-type) — idempotent success in
+            every case. No response body.
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -315,9 +447,14 @@ paths:
         '401':
           description: >-
             Missing/malformed `Authorization` header, invalid signature, expired
-            token, missing `sub`, unknown user, **or `type != "access"`** — this last
-            case is finding #1's fail-closed fix: a refresh token presented here is
-            rejected with this same generic message, not a distinguishing one.
+            token, missing `sub`, unknown user, `type != "access"` (finding #1's
+            fail-closed fix — a refresh token presented here is rejected with this
+            same generic message), **or (OBJ-002) `ver` claim not equal to the
+            user's current `token_version`** — this last case means the access
+            token was issued before the user's most recent password reset and is
+            treated as invalidated even though it hasn't naturally expired yet. All
+            causes share the identical generic message, per this service's existing
+            anti-oracle design.
           content:
             application/json:
               schema:
@@ -335,7 +472,14 @@ components:
         Access token only. `app/api/deps.get_current_user` decodes the token and
         rejects it (401) unless the `type` claim is exactly `"access"` — a refresh
         token is fail-closed rejected here, never accepted as a substitute (audit
-        finding #1). See design notes §1 for the full claim schema.
+        finding #1). See `obj-001-design-notes.md` §1 for the full claim schema.
+        As of OBJ-002, the same handler also compares the token's `ver` claim
+        against the user's current `token_version` (loaded as part of the same DB
+        read already required to fetch the `User` row — no extra query) and
+        rejects on mismatch; see `obj-002-design-notes.md` §3. Access tokens are
+        deliberately **not** checked against any session/revocation table — they
+        stay fully stateless for latency, backed only by their short natural
+        expiry and this `ver` check.
 
   responses:
     ValidationError:
@@ -430,13 +574,35 @@ components:
       properties:
         access_token:
           type: string
-          description: 'JWT with claims `{sub, exp, iat, type: "access"}`.'
+          description: >-
+            JWT with claims `{sub, exp, iat, type: "access", ver}`. `ver` (OBJ-002)
+            is the user's `token_version` at issuance time — see
+            `obj-002-design-notes.md` §3. Never carries a `jti`; access tokens are
+            not tracked in any persistence table.
         token_type:
           type: string
           enum: ["bearer"]
         refresh_token:
           type: string
-          description: 'JWT with claims `{sub, exp, iat, type: "refresh"}`.'
+          description: >-
+            JWT with claims `{sub, exp, iat, type: "refresh", ver, jti}`. `jti`
+            (OBJ-002) is the primary key of this token's row in the
+            `refresh_sessions` table; `ver` is the user's `token_version` at
+            issuance time. From `/auth/login` this seeds a new session family; from
+            `/auth/refresh` this is a freshly rotated token in the same family as
+            the one submitted — never the same string that was submitted. See
+            `obj-002-design-notes.md` §1-3.
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      description: >-
+        Shared request shape for `/auth/refresh` and `/auth/logout` (OBJ-002) — both
+        endpoints authenticate the caller purely via possession of a valid refresh
+        token, with no separate `Authorization` header requirement.
+      properties:
+        refresh_token:
+          type: string
 
     EmailRequest:
       type: object

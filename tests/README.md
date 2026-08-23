@@ -54,6 +54,20 @@ was worked around, and that service was never touched. `docker compose -f
 docker-compose.test.yml up -d` is the intended, supported path going
 forward.
 
+## OBJ-002 pass (2026-08-21, qa-engineer, red phase)
+
+`tests/api/test_logout.py`, `test_refresh_rotation.py`,
+`test_password_reset_invalidation.py`, `test_legacy_token_fail_closed.py`
+(22 tests total) translate the 16 Gherkin scenarios in
+`docs/requirements/obj-002-session-token-lifecycle.md` against
+`docs/api/openapi.yaml` v0.3.0-obj-002 / `docs/api/obj-002-design-notes.md`.
+Verified against the same kind of throwaway self-provisioned Postgres as
+every prior pass: **20 failed, 2 passed** in isolation; **20 failed, 51
+passed** for the full suite (zero regressions against OBJ-001's 49). Full
+breakdown, scope boundaries, and risk notes for `developer` are in
+`.ai-context/dependency_graph.md` under "OBJ-002 — Phase 2 (red phase)" —
+not duplicated here to avoid the two documents drifting out of sync.
+
 ## Layout
 
 - `tests/conftest.py` -- env-var bootstrap (must precede any `app.*`

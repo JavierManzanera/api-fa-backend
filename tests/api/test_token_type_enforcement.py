@@ -47,8 +47,21 @@ async def test_scenario_1_2_refresh_token_rejected_on_protected_endpoint(
 async def test_scenario_1_3_refresh_token_accepted_on_refresh_endpoint(
     client, api_prefix, user_factory
 ):
-    user, _ = await user_factory(email="carol@example.com")
-    refresh_token = security.create_refresh_token(user.email)
+    """OBJ-002 note: sourced via a real /auth/login call (not
+    security.create_refresh_token() called directly) -- OBJ-002 backs every
+    refresh token with a `refresh_sessions` row created at issuance
+    (docs/api/obj-002-design-notes.md section 1-2), so a token minted
+    without going through an actual issuance endpoint has no row to match
+    and would 401 for a reason unrelated to what this scenario tests (token
+    *type* acceptance, not session-table bookkeeping). Login is the
+    realistic way any refresh token actually enters the system."""
+    user, password = await user_factory(email="carol@example.com")
+    login_resp = await client.post(
+        f"{api_prefix}/auth/login",
+        data={"username": user.email, "password": password},
+    )
+    assert login_resp.status_code == 200, login_resp.text
+    refresh_token = login_resp.json()["refresh_token"]
 
     resp = await client.post(
         f"{api_prefix}/auth/refresh", json={"refresh_token": refresh_token}
