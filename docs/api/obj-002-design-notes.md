@@ -315,3 +315,26 @@ a decision before/during implementation:
 5. **"Log out all devices" endpoint** — noted in §4 as a natural, cheap future extension (the
    `(user_id, revoked_at)` index already supports it) but explicitly not built now. Confirm it
    stays out of OBJ-002's scope.
+
+---
+
+## Phase 3 implementation addendum (developer, 2026-08-21)
+
+- **FK-ordering fix in `/auth/refresh`'s rotation path** (implementation-level, not a design
+  deviation): setting the superseded row's `replaced_by` in the same flush as the new row's INSERT
+  triggers a `ForeignKeyViolationError` — SQLAlchemy's unit-of-work doesn't infer the same-table
+  insert-before-update dependency automatically. Fixed with an explicit `await db.flush()`
+  immediately after the new row is added, before the old row's `revoked_at`/`replaced_by` are set —
+  same transaction, same atomicity, pure statement-ordering fix.
+- **`tests/api/test_token_type_enforcement.py`'s `test_scenario_1_3_*` updated, not left as-is**:
+  it previously minted a refresh token by calling `security.create_refresh_token()` directly,
+  bypassing `/auth/login` — under OBJ-002, every real refresh token is backed by a `refresh_sessions`
+  row created at issuance, so a directly-minted token has no matching row and correctly 401s on the
+  "no row found" branch (the same branch that must reject legacy/forged/purged tokens). The test now
+  sources its token via a real `/auth/login` call instead — the scenario under test (a valid,
+  correctly-typed, correctly-signed refresh token is accepted) is still fully exercised, just via a
+  realistic issuance path. No other test needed a similar fix (grepped the whole suite for direct
+  `create_refresh_token(...)` calls feeding `/auth/refresh`).
+
+Full Gate 3 verification: `docs/testing/obj-002-test-report.md`. Schema review:
+`docs/database/obj-002-schema-review.md`.

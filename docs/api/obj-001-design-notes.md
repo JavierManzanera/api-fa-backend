@@ -192,3 +192,21 @@ None of these block `qa-engineer` from writing contract tests against `openapi.y
 stands — the tests can assert "a 429 is returned after N+1 requests" and "the same 400 is
 returned after the configured max attempts" parametrized on whatever value `developer` ends up
 wiring into settings, without the exact number being fixed at the architecture layer.
+
+---
+
+## Phase 3 implementation addendum (developer, 2026-08-21)
+
+Two independent decisions taken where this document deliberately left the choice open:
+- **OTP lockout invalidation**: chose "set `expires_at = now()`" over "delete the row" — deleting
+  would break the resend-cooldown's stated purpose (nothing would remain for the cooldown check to
+  find), letting an attacker immediately reset their budget after lockout.
+- **Rate limiter storage**: one row per accepted request + `COUNT(...)` sliding window, not a
+  per-key counter+bucket — simpler and consistent with the freezegun no-server-side-`now()`
+  requirement; accepted the extra row growth (tracked as a cleanup item in OBJ-006).
+- Thresholds wired as module-level constants in `auth.py`, not `Settings` fields (`MAX_OTP_ATTEMPTS
+  = 5`, `OTP_RESEND_COOLDOWN_SECONDS = 60`, etc.) — matches the values `qa-engineer` hardcoded in
+  the test files, kept scope minimal.
+
+Full Gate 3 verification: `docs/testing/obj-001-test-report.md`. Schema review:
+`docs/database/obj-001-schema-review.md`.
