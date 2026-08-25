@@ -16,7 +16,7 @@ from app.core import audit_log
 from app.core import notifications
 from app.core.config import settings
 from app.core.email.base import EmailSender, EmailSendError
-from app.core.email.templates import render_verification_email
+from app.core.email.templates import render_verification_email, render_already_registered_email
 from app.models.user import User
 from app.models.verification import Verification
 from app.models.refresh_session import RefreshSession
@@ -42,6 +42,23 @@ RESET_PASSWORD_OTP_TTL_MINUTES = 10
 RESET_PASSWORD_PURPOSE = "reset_password"
 GENERIC_OTP_SENT_MESSAGE = "If the email exists, an OTP has been sent."
 GENERIC_OTP_INVALID_MESSAGE = "Invalid or expired OTP"
+
+# OBJ-007 (obj-007-design-notes.md section 1, closes audit finding #6):
+# returned identically by BOTH branches of POST /auth/register -- the new
+# generic response replacing the old 201+UserResponse / 400 split. Same
+# "if X, then Y" conditional-phrasing convention as GENERIC_OTP_SENT_MESSAGE.
+GENERIC_REGISTRATION_MESSAGE = (
+    "If this email is not already registered, we've sent you a "
+    "verification code to complete your registration."
+)
+# OBJ-007 (design notes section 3): identical wording on BOTH branches'
+# failure mode -- deliberately branch-agnostic ("a required email", not
+# "the verification code" or "the notification"), matching openapi.yaml's
+# /auth/register 503 example verbatim.
+REGISTER_EMAIL_SEND_FAILED_MESSAGE = (
+    "Registration could not be completed because a required email could "
+    "not be sent. Please try again."
+)
 
 # OBJ-005 (obj-005-design-notes.md sections 1-2): email-verification reuses
 # the same Verification table/OTP mechanism as password reset, under its
@@ -200,7 +217,7 @@ async def read_current_user(
     return current_user
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register")
 async def register(
     http_request: Request,
     user_in: UserCreate,
@@ -208,26 +225,36 @@ async def register(
     email_sender: EmailSender = Depends(deps.get_email_sender),
 ) -> Any:
     """OBJ-005 (design notes section 2.3, Gate 1 decision 3): registration
-    now also generates an `email_verification` code and sends it via the
-    injected EmailSender. If the send fails, the ENTIRE registration is
-    rolled back (no User row, no Verification row survive) and the
-    endpoint returns 503 -- the user has no other path to receive the
-    code, so a half-created, unverifiable account must never exist.
+    generates an `email_verification` code and sends it via the injected
+    EmailSender. If the send fails, the ENTIRE registration is rolled back
+    (no User row, no Verification row survive) and the endpoint returns
+    503 -- the user has no other path to receive the code, so a
+    half-created, unverifiable account must never exist.
 
-    Uses flush() (not commit()) for both inserts so a failed send can be
-    undone with a clean db.rollback() -- no compensating deletes, no
-    window where a partially-created user is externally visible.
+    OBJ-007 (design notes, closes audit finding #6): the response is now
+    IDENTICAL -- same 200 status, same generic MessageResponse body -- for
+    both a new email and an already-registered one (see
+    GENERIC_REGISTRATION_MESSAGE above). The duplicate-email branch below
+    (`_handle_duplicate_email_registration`) creates zero new rows, pays
+    the same bcrypt-hash cost as the new-account branch (timing parity per
+    design notes section 3), and sends a different notification email
+    through the same EmailSender -- whose own send failure now also 503s,
+    symmetrically with the new-account branch. Audit logging is exempt
+    from this parity requirement (design notes section 2): outcome still
+    distinguishes success/duplicate internally.
     """
     ip = rate_limit.client_ip(http_request)
     result = await db.execute(select(User).filter(User.email == user_in.email))
     user = result.scalars().first()
-    if user:
-        audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="duplicate")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The user with this email already exists in the system.",
-        )
 
+    if user:
+        return await _handle_duplicate_email_registration(user_in, ip, email_sender)
+    return await _handle_new_email_registration(db, user_in, ip, email_sender)
+
+
+async def _handle_new_email_registration(
+    db: AsyncSession, user_in: UserCreate, ip: str, email_sender: EmailSender
+) -> Any:
     user = User(
         email=user_in.email,
         hashed_password=security.get_password_hash(user_in.password),
@@ -257,13 +284,39 @@ async def register(
         )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Registration could not be completed: the verification email could not be sent. Please try again.",
+            detail=REGISTER_EMAIL_SEND_FAILED_MESSAGE,
         )
 
     await db.commit()
-    await db.refresh(user)
     audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="success")
-    return user
+    return {"msg": GENERIC_REGISTRATION_MESSAGE}
+
+
+async def _handle_duplicate_email_registration(
+    user_in: UserCreate, ip: str, email_sender: EmailSender
+) -> Any:
+    # OBJ-007 design notes section 3: pay the same bcrypt-HASH cost the
+    # new-account branch pays (security.get_password_hash, not
+    # verify_password_or_dummy -- that's a verify, a different operation,
+    # not guaranteed to cost the same). Result is discarded; the call
+    # exists purely for its constant-cost side effect. No User/Verification
+    # row is created here (design notes section 2).
+    security.get_password_hash(user_in.password)
+
+    subject, body = render_already_registered_email()
+    try:
+        await email_sender.send(to=user_in.email, subject=subject, body=body)
+    except EmailSendError:
+        audit_log.log_auth_event(
+            "auth.register", email=user_in.email, ip=ip, outcome="email_send_failed"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=REGISTER_EMAIL_SEND_FAILED_MESSAGE,
+        )
+
+    audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="duplicate")
+    return {"msg": GENERIC_REGISTRATION_MESSAGE}
 
 
 @router.post("/login", response_model=Token)
