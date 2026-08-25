@@ -6,7 +6,7 @@
 - **Negative case PROVEN**: with `pg_hba.conf` flipped to `hostnossl` (server refuses any SSL-negotiated connection), the same `require`-configured app fails hard (`InvalidAuthorizationSpecificationError`) — it does **not** silently fall back to plaintext. A `disable`-mode control against the same `hostnossl` server succeeds, isolating the failure to the app's own explicit TLS requirement rather than a broken server.
 - **`verify-full` failure path PROVEN** (real app code): against our self-signed cert with no CA trust configured anywhere, `verify-full` correctly fails closed with `CERTIFICATE_VERIFY_FAILED: self-signed certificate`.
 - **`verify-full` success mechanism PROVEN, but via a standalone harness, not the app's own code** — see Finding 1. `ssl.create_default_context()`'s `CERT_REQUIRED` + hostname-check posture genuinely works and genuinely succeeds once a CA is trusted; confirmed with a manually-scoped `cafile=` trust anchor (our own self-signed cert), not the OS trust store.
-- **Finding 1 (residual gap, not a bug)**: `app/core/config.py` has no `POSTGRES_SSL_ROOT_CERT` (or equivalent) setting. `verify-full` (`app/core/database.py`'s `_build_ssl_connect_arg`) calls bare `ssl.create_default_context()`, which trusts only the OS/system default CA store — there is no app-level way to pin a private/self-signed CA. `verify-full` today only works against certs from a publicly-trusted CA (or one an operator has separately added to the host's OS trust store out-of-band). Not something this pass changed — flagged for whoever picks up hardening `verify-full` next.
+- **Finding 1 (residual gap, not a bug)**: `app/core/config.py` has no `POSTGRES_SSL_ROOT_CERT` (or equivalent) setting. `verify-full` (`app/core/database.py`'s `_build_ssl_connect_arg`) calls bare `ssl.create_default_context()`, which trusts only the OS/system default CA store — there is no app-level way to pin a private/self-signed CA. `verify-full` today only works against certs from a publicly-trusted CA (or one an operator has separately added to the host's OS trust store out-of-band). Not something this pass changed — flagged for whoever picks up hardening `verify-full` next. **UPDATE (§7, 2026-08-25): CLOSED.** `POSTGRES_SSL_ROOT_CERT` added and re-verified end-to-end through the real app code.
 - **Trust-store mutation deliberately not performed**: `certutil -user -addstore Root` was attempted to trust the self-signed CA for an end-to-end app-code `verify-full` success run, and was blocked by the harness's own safety classifier (system-trust-store mutation). Not routed around via another tool (e.g. PowerShell `Import-Certificate`) — see §4.
 - Self-signed cert caveat (unconditional, applies to everything above): this proves the TLS **mechanism** end-to-end (real handshake, real cipher, real cert/hostname verification logic). It does not exercise a real CA-issued certificate, certificate chains/intermediates, OCSP/CRL revocation checking, or a managed Postgres provider's actual TLS termination (e.g. RDS/Cloud SQL) — those remain untested by this pass.
 
@@ -18,6 +18,7 @@
 - §4 [`verify-full`: failure path (real app code) + success mechanism (standalone) + Finding 1](#4-verify-full-failure-path-real-app-code--success-mechanism-standalone--finding-1) — the CA-pinning gap and why the trust-store approach was abandoned.
 - §5 [Teardown / cleanup confirmation](#5-teardown--cleanup-confirmation)
 - §6 [Residual caveats](#6-residual-caveats) — what this pass does NOT prove.
+- §7 [Finding 1 / audit finding #18 — fix verified](#7-finding-1--audit-finding-18--fix-verified-2026-08-25-developer) — `POSTGRES_SSL_ROOT_CERT` added, re-verified end-to-end through the real app code; closed.
 
 ## 1. Environment set up
 
@@ -118,3 +119,49 @@ This confirms the underlying TLS/cert/hostname verification logic `verify-full` 
 - **Managed Postgres providers** (RDS, Cloud SQL, Azure Database for PostgreSQL, etc.) terminate TLS with provider-managed certs and often ship their own root bundle for `verify-full`-equivalent configs — none of that provider-specific behavior was exercised here.
 - **`verify-full` custom-CA support is unproven because it doesn't exist** in the app today (Finding 1) — this is a config-surface gap, not a test gap; no amount of additional test-writing closes it without a code change.
 - **Local-only run**: everything here ran against a same-host `localhost`/`127.0.0.1` connection. No network path, proxy, or firewall was between client and server, so no MITM-interception scenario was actually attempted (nor would that be meaningful against `require` mode, which is explicitly documented — `.env.example` — as not defending against one).
+
+## 7. Finding 1 / audit finding #18 — fix verified (2026-08-25, developer)
+
+**Closed.** `POSTGRES_SSL_ROOT_CERT` (optional, default `None`) added to
+`app/core/config.py`'s `Settings`; `app/core/database.py`'s
+`_build_ssl_connect_arg` now takes a second `root_cert` parameter and
+forwards it to `ssl.create_default_context(cafile=root_cert)` for
+`verify-full` (`require`/`disable` are unaffected — `require` never
+verifies a certificate at all, so a trust anchor is meaningless there).
+`.env.example` documents the new setting.
+
+Re-ran this section's own §4 experiment end-to-end, through the **real app
+code path** this time (§4's original success proof used a standalone
+harness, not `app.core.database` itself — see §4's own caveat), against a
+newly-provisioned disposable Postgres 16 (port 5437, same self-signed-cert/
+`hostssl`-only setup as §1, torn down after):
+
+- `POSTGRES_SSL_MODE=verify-full`, `POSTGRES_SSL_ROOT_CERT` unset — **negative
+  case re-confirmed unchanged**: `SSLCertVerificationError: … self-signed
+  certificate`, byte-for-byte the same failure as §4's original run. No
+  regression for every deployment that doesn't set the new setting.
+- `POSTGRES_SSL_MODE=verify-full`, `POSTGRES_SSL_ROOT_CERT=<path to the
+  self-signed server.crt>` — **positive case now proven through
+  `app.core.database.engine` itself** (not a standalone harness): connects,
+  and `pg_stat_ssl` for that exact backend pid reports `{'ssl': True,
+  'version': 'TLSv1.3', 'cipher': 'TLS_AES_256_GCM_SHA384'}`. `RESULT:
+  CONNECTED_OK`.
+
+Unit coverage: `tests/unit/test_database_ssl.py::TestVerifyFullModeRootCert`
+(cafile forwarding, no-regression-when-unset, posture unchanged, `require`
+ignores it) and `tests/unit/test_postgres_ssl_root_cert_startup.py` (Settings
+field read-back / default / doesn't leak into other modes). Full `tests/unit/`
+suite re-run clean (133 passed) after the change.
+
+**For security-specialist's follow-up verification** (this developer note is
+not that review — `docs/security/audit-report.md` is the owned artifact for
+the actual Gate 3 sign-off on finding #18): the fix is additive and
+opt-in-only (new field defaults to `None`, reproducing prior behavior
+exactly when unset), so the main things worth an independent look are (a)
+that an operator-supplied bad/missing `POSTGRES_SSL_ROOT_CERT` path fails
+closed rather than silently falling back to the OS trust store (it does —
+`ssl.create_default_context(cafile=<bad path>)` raises `FileNotFoundError`
+at engine-construction/startup time, same fail-closed posture as every other
+`POSTGRES_SSL_*` misconfiguration in this file), and (b) that this doesn't
+reopen any MITM surface for the existing `require`/`disable` modes (it
+doesn't — `root_cert` is plumbed only into the `verify-full` branch).
