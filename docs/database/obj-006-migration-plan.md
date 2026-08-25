@@ -20,12 +20,16 @@ explicitly deferred, not a migration (§5) · 7 Gate-1 tradeoffs, all APPROVED 2
 "Gate 1 — APPROVED" below) · devops-engineer handoff list (§8, superseded/extended by the second
 "Handoff" section near the bottom, post-migration-authorship). **Read this if you only have time
 for one thing:** "CRITICAL finding: migration 0008 breaks the current `/auth/refresh` handler" —
-migration 0008 is written but NOT SAFE TO DEPLOY past 0007 until `developer` reorders that
-handler. Jump to: "1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role
-separation", "4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item",
-"7. Gate-1 open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration
-authorship", "CRITICAL finding", "Environment blocker: greenlet", "devops-engineer pass
-(2026-08-25)", "database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)".
+**RESOLVED as of OBJ-010 (2026-08-25): `developer` reordered the handler (commit `f1758a5`), CI is
+unpinned to head, migration 0008 is now safe to deploy** — see that section's own "FIXED" note and
+the later "CI unpinned from 0007 to head" section for the two confirmation passes. Jump to:
+"1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role separation",
+"4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item", "7. Gate-1
+open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration authorship",
+"CRITICAL finding" (+ its "FIXED" sub-note), "Environment blocker: greenlet", "devops-engineer pass
+(2026-08-25)", "database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)",
+"CI unpinned from 0007 to head" (OBJ-010, this pass — CI now runs migration 0008/head,
+independently re-verified: clean `alembic upgrade head` + 281 passed).
 
 **Backlog items covered, traced to their source** (all read directly from
 `.ai-context/dependency_graph.md`'s OBJ-006 row and the OBJ-001/002/003 database-architect review
@@ -712,3 +716,44 @@ against an already-INET column, unrelated to role provisioning.
 Files changed: `docs/database/sql/provision_db_roles.sql` (header comment rewritten, DML-grant
 block removed). No changes to `alembic/versions/0007_grant_dml_role_privileges.py` or
 `scripts/ci/role_separation_bootstrap.sql` — both already correct, used as-is/as precedent.
+
+## CI unpinned from 0007 to head (2026-08-25, database-architect, OBJ-010 second step)
+
+Second step of OBJ-010, on branch `obj-010-refresh-rotation-reorder` (`f1758a5`/`00fe79e` already on
+it from `developer`'s handler-reorder fix, see the "FIXED" note above under the CRITICAL finding).
+With that fix landed, migration 0008 is no longer app-incompatible, so `.github/workflows/ci.yml`'s
+`test-alembic-schema-drift` job no longer has a reason to stop at 0007.
+
+**Change:** that job's `alembic upgrade 0007_grant_dml_role_privileges` step is now `alembic upgrade
+head` (job renamed from "pytest (alembic-provisioned schema, stops at 0007)" to "... (head)"). The
+stale "CRITICAL: never head" comment block above that step is replaced with a note pointing at this
+section. `role-separation-smoke-test` (a different job, testing grant behavior specifically at 0007)
+was deliberately left untouched — migration 0008 is an index, not a grant, so it has no bearing on
+that job's scope.
+
+**Independent re-verification** (database-architect, this pass, not reusing `developer`'s numbers
+uncritically): fresh throwaway Postgres 16 via `initdb`/`pg_ctl` (own data dir, port 5436, `trust`
+auth, torn down after), fresh per-worktree `.venv` built from this branch's `requirements-dev.lock.txt`
+(no `greenlet`/Application Control blocker on this run — `import greenlet` succeeded directly, and
+`initdb.exe` itself ran with no issue either):
+- `MIGRATOR_DATABASE_URL=postgresql+psycopg2://test:test@localhost:5436/api_fa_test alembic upgrade
+  head` — all 8 migrations applied cleanly in sequence (0001 through 0008), `fa_app`/`fa_migrator`
+  grants correctly no-op'd (no such roles in this throwaway DB, expected per §3). Confirmed via
+  `psql`: `alembic_version` = `0008_refresh_sess_partial_uniq`, and `\d refresh_sessions` shows
+  `ux_refresh_sessions_family_id_active` (`UNIQUE, btree (family_id) WHERE revoked_at IS NULL`)
+  present as expected.
+- `TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5436/api_fa_test
+  TEST_DB_SCHEMA_SOURCE=alembic pytest` against that same head-migrated schema — **281 passed**, 0
+  failed (matches `developer`'s own OBJ-010 count exactly: 279 pre-existing + the 2 new
+  `test_obj010_*` rotation tests).
+
+Migration 0008's own docstring and `tests/README.md`'s alembic-mode instructions both carried a
+"stop at 0007 / never head" warning predating this fix — both updated in this same pass with a
+short RESOLVED addendum pointing back here, rather than left stale for a future reader to
+rediscover or (worse) re-block on.
+
+No env vars beyond what CI already set were needed — `test-alembic-schema-drift` already exports
+`MIGRATOR_DATABASE_URL`/`TEST_DATABASE_URL` at the workflow-file `env:` level (matching
+`docker-compose.test.yml`'s port 5433), and `alembic/env.py`'s own placeholder-`Settings` block
+(§ "env.py design note" above, plus the `ENVIRONMENT` fix already recorded in this doc) already
+covers everything `Base`/model imports need without a real `.env`. Nothing new required.
