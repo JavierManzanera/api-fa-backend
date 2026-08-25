@@ -7,3 +7,10 @@ pytest==9.1.1
 pytest-asyncio==1.4.0
 httpx==0.28.1
 freezegun==1.5.5
+
+# OBJ-006 (devops-engineer, audit-report.md finding #12): dependency
+# vulnerability scanner, run in CI against the resolved/locked dependency
+# tree (see requirements.lock.txt and .github/workflows/ci.yml). Pinned
+# for reproducible CI runs, same convention as every other dev dependency
+# in this file.
+pip-audit==2.9.0

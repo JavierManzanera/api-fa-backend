@@ -1,0 +1,206 @@
+name: CI
+
+# OBJ-006 (devops-engineer, 2026-08-25). First CI pipeline for this repo
+# (no .github/workflows/ existed before this pass). Design notes live in
+# docs/database/obj-006-migration-plan.md's devops-engineer handoff
+# sections -- this file is the implementation of that handoff, not a fresh
+# design. See requirements.lock.txt / requirements-dev.lock.txt for the
+# lockfile mechanism this installs from.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  # Matches docker-compose.test.yml exactly (port 5433, not 5432 --
+  # deliberate, see that file's own header comment).
+  TEST_DATABASE_URL: postgresql+asyncpg://test:test@localhost:5433/api_fa_test
+  MIGRATOR_DATABASE_URL: postgresql+psycopg2://test:test@localhost:5433/api_fa_test
+
+jobs:
+  # --- Supply-chain gate (audit-report.md finding #12) -----------------
+  dependency-audit:
+    name: pip-audit (supply chain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock.txt
+
+      - name: Install locked dependency tree
+        run: pip install -r requirements-dev.lock.txt
+
+      - name: pip-audit against both locked dependency trees
+        # --ignore-vuln PYSEC-2026-1325: python-ecdsa's known, upstream-
+        # unfixed side-channel/non-constant-time-arithmetic advisory
+        # (python-ecdsa's own maintainers do not treat this as fixable in a
+        # pure-Python implementation -- no patched release exists). Pulled
+        # in transitively by python-jose (Requires: ecdsa, pyasn1, rsa --
+        # unconditional, NOT removed by the [cryptography] extra this repo
+        # already pins; confirmed via `pip show python-jose`). Verified
+        # locally 2026-08-25 against requirements.lock.txt /
+        # requirements-dev.lock.txt: this is the ONLY finding in either
+        # lock file today. A specific --ignore-vuln (not a blanket
+        # --skip-audit or severity threshold) so any NEW vulnerability in
+        # any package still fails this job loudly. Revisit if python-jose
+        # ever drops the unconditional ecdsa dependency, or a real fix
+        # lands upstream.
+        run: |
+          pip-audit -r requirements.lock.txt --ignore-vuln PYSEC-2026-1325
+          pip-audit -r requirements-dev.lock.txt --ignore-vuln PYSEC-2026-1325
+
+  # --- Primary regression gate: schema via Base.metadata.create_all -----
+  # Matches the test suite's default/documented mode (tests/README.md) and
+  # every prior objective's Gate 3 pass. This is the REQUIRED gate.
+  test:
+    name: pytest (create_all schema)
+    needs: dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock.txt
+
+      - name: Install locked dependency tree
+        run: pip install -r requirements-dev.lock.txt
+
+      # NOTE on greenlet: an earlier local-dev pass on this project hit a
+      # Windows Application Control policy blocking greenlet's native
+      # extension (see tests/README.md "KNOWN BLOCKER" section, RESOLVED
+      # on that machine 2026-08-25 after a reboot). That was a Windows-
+      # local machine policy, not a project/CI issue -- GitHub-hosted
+      # runners are Linux and were never subject to it. Not defended
+      # against here beyond this note.
+      - name: Start disposable test Postgres
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Run full test suite (unit + api)
+        run: pytest
+
+      - name: Tear down test Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  # --- DDL/DML role separation (audit-report.md finding #14) -----------
+  # Gate-1 APPROVED 2026-08-23 ("CI role-separation enforcement: adopted",
+  # obj-006-migration-plan.md section 3 / "Gate 1 -- APPROVED"). Exercises
+  # the real fa_migrator (DDL)/fa_app (DML-only) split end to end: bootstrap
+  # roles, migrate to 0007 as fa_migrator (which grants DML to fa_app),
+  # then assert fa_app can do ordinary DML and genuinely cannot escalate to
+  # DDL. This is the closer-to-prod approximation local/test deliberately
+  # skips (obj-006-migration-plan.md section 3, "Local dev/test" -- role
+  # separation there would add friction for no real benefit against an
+  # ephemeral single-developer database).
+  role-separation-smoke-test:
+    name: DDL/DML role separation (finding #14)
+    needs: dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock.txt
+
+      - name: Install locked dependency tree
+        run: pip install -r requirements-dev.lock.txt
+
+      - name: Start disposable test Postgres
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Bootstrap fa_migrator/fa_app roles (CI-scoped subset)
+        # Runs as the disposable Postgres's own superuser (docker-compose.
+        # test.yml's POSTGRES_USER=test) -- fine here since this is a
+        # throwaway CI database, never a real credential. See the SQL
+        # file's own header for why this is a narrower subset of
+        # docs/database/sql/provision_db_roles.sql (that script's DML-grant
+        # block assumes the 4 tables already exist; a CI database starts
+        # empty).
+        env:
+          PGPASSWORD: test
+        run: psql -h localhost -p 5433 -U test -d api_fa_test -v ON_ERROR_STOP=1 -f scripts/ci/role_separation_bootstrap.sql
+
+      - name: Migrate to 0007 as fa_migrator (grants DML to fa_app)
+        env:
+          MIGRATOR_DATABASE_URL: postgresql+psycopg2://fa_migrator:ci_migrator_pw@localhost:5433/api_fa_test
+        run: alembic upgrade 0007_grant_dml_role_privileges
+
+      - name: Verify fa_app has DML, not DDL
+        run: bash scripts/ci/verify_role_separation.sh
+
+      - name: Tear down test Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
+
+  # --- Advisory gate: schema via real Alembic migrations (0001..0007) ---
+  # Proves the migrations in alembic/versions/ produce a schema the
+  # existing test suite actually accepts, not just that `alembic upgrade`
+  # runs without erroring -- the only real regression check against
+  # ORM/migration drift (obj-006-migration-plan.md handoff section).
+  #
+  # continue-on-error: true -- KNOWN FAILING as of 2026-08-25 (verified
+  # locally, not assumed): migration 0006 (rate_limit_hit_ip_to_inet)
+  # changes `rate_limit_hits.ip` to native Postgres INET, but
+  # app/models/rate_limit.py:36 still declares it `Mapped[str] =
+  # mapped_column(String, ...)`. Every rate-limit-gated endpoint request
+  # then fails with "operator does not exist: inet = character varying"
+  # (asyncpg UndefinedFunctionError) -- confirmed as the SINGLE root cause
+  # behind all ~60 failures this job produces (every other test passes).
+  # This is a model/migration drift bug for `developer`/`database-architect`
+  # to fix (RateLimitHit.ip needs sqlalchemy.dialects.postgresql.INET, or
+  # an explicit cast in the rate-limit query) -- out of devops-engineer
+  # scope to fix here. Kept non-blocking so this real, separate bug doesn't
+  # block unrelated merges, but still runs on every PR so its own log stays
+  # the up-to-date, visible record of the drift until it's fixed -- flip
+  # continue-on-error back to false (or remove it) once that lands.
+  #
+  # CRITICAL: stops at 0007_grant_dml_role_privileges, NEVER `head` / 0008.
+  # Migration 0008 (refresh_sess_partial_uniq) is confirmed to
+  # deterministically break the current /auth/refresh rotation handler
+  # (see obj-006-migration-plan.md "CRITICAL finding") -- do not change
+  # this target until a developer pass reorders that handler and the
+  # migration-plan doc is updated to say 0008 is safe.
+  test-alembic-schema-drift:
+    name: pytest (alembic-provisioned schema, stops at 0007 -- advisory)
+    needs: dependency-audit
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock.txt
+
+      - name: Install locked dependency tree
+        run: pip install -r requirements-dev.lock.txt
+
+      - name: Start disposable test Postgres
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Provision schema via Alembic (stop at 0007, never head)
+        run: alembic upgrade 0007_grant_dml_role_privileges
+
+      - name: Run full test suite against the migrated schema
+        env:
+          TEST_DB_SCHEMA_SOURCE: alembic
+        run: pytest
+
+      - name: Tear down test Postgres
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v

@@ -1,13 +1,34 @@
-fastapi
-uvicorn
-sqlalchemy
-alembic
-psycopg2-binary
-asyncpg
-pydantic
-pydantic-settings
-email-validator
-passlib[bcrypt]
+# OBJ-006 (devops-engineer, audit-report.md finding #12): every direct
+# dependency pinned to an exact version verified working against this
+# repo's own test suite + Alembic migration history in this environment
+# (2026-08-25). See requirements.lock.txt for the full transitively-pinned
+# closure CI actually installs from -- this file is the human-edited
+# source of direct dependencies; the lock file is generated from it (see
+# docs/database/obj-006-migration-plan.md addendum / this file's own
+# regeneration instructions below).
+#
+# To regenerate the lock file after bumping a version here:
+#   python -m venv .venv-lock
+#   .venv-lock/Scripts/pip install -r requirements.txt -r requirements-dev.txt
+#   .venv-lock/Scripts/pip freeze > requirements.lock.txt
+#   (then re-add this header comment block, pip freeze doesn't preserve it)
+fastapi==0.141.1
+uvicorn==0.52.4
+sqlalchemy==2.0.52
+alembic==1.19.1
+psycopg2-binary==2.9.12
+asyncpg==0.31.0
+pydantic==2.13.4
+pydantic-settings==2.15.0
+email-validator==2.3.0
+passlib[bcrypt]==1.7.4
 bcrypt==3.2.2
-python-jose[cryptography]
-python-multipart
+python-jose[cryptography]==3.5.0
+python-multipart==0.0.32
+
+# OBJ-006 (devops-engineer, obj-006-migration-plan.md section 4): scheduled
+# cleanup jobs for rate_limit_hits/refresh_sessions, chosen over pg_cron so
+# the refresh_sessions retention floor can read Settings.REFRESH_TOKEN_EXPIRE_DAYS
+# directly instead of drifting out of sync with a hardcoded SQL literal. See
+# app/core/scheduler.py.
+apscheduler==3.11.3

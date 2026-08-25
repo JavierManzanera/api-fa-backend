@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.core.security_headers import SecurityHeadersMiddleware
 from app.api.v1.router import api_router
 from app.core.database import engine, Base
+from app.core.scheduler import build_scheduler
 from app.models import user, verification, rate_limit, refresh_session
 import uvicorn
 
@@ -24,7 +25,20 @@ async def lifespan(app: FastAPI):
     # In production, use Alembic. For quick start, this works.
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    yield
+
+    # OBJ-006 (devops-engineer, obj-006-migration-plan.md section 4):
+    # scheduled cleanup jobs for rate_limit_hits/refresh_sessions -- see
+    # app/core/scheduler.py for the full design/rationale. Never runs
+    # during the test suite: httpx.ASGITransport does not send ASGI
+    # lifespan events unless explicitly wrapped, which tests/conftest.py's
+    # `client` fixture deliberately does not do -- so this adds no risk to
+    # the existing test suite.
+    scheduler = build_scheduler()
+    scheduler.start()
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
 
 
 # OBJ-004 finding #13 (obj-004-design-notes.md section 3): docs endpoints

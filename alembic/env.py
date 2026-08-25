@@ -96,6 +96,15 @@ os.environ.setdefault(
 os.environ.setdefault("ALGORITHM", "HS256")
 os.environ.setdefault("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 os.environ.setdefault("REFRESH_TOKEN_EXPIRE_DAYS", "7")
+# OBJ-006 (devops-engineer, 2026-08-25): ENVIRONMENT (obj-004-design-notes.md
+# section 3) postdates this placeholder block and has no Settings-level
+# default -- without this line, `alembic upgrade` fails at import time with
+# a pydantic ValidationError on every environment, not just CI, since this
+# whole block exists precisely to avoid requiring a real .env for a schema
+# migration. "development" is an inert choice here: ENVIRONMENT only gates
+# FastAPI docs-route registration in app.main, which this migration-only
+# import path never reaches.
+os.environ.setdefault("ENVIRONMENT", "development")
 
 from app.core.database import Base  # noqa: E402
 from app.models import user, verification, rate_limit, refresh_session  # noqa: E402,F401

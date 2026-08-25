@@ -598,3 +598,30 @@ pinning/lockfile/`pip-audit` per finding #12 — fully untouched by this pass). 
   vs. both — the latter is the only real regression check against ORM/migration schema drift.
 - The `greenlet` Application Control block will likely affect CI too if the runner shares this
   environment's policy — verify before assuming otherwise.
+
+## devops-engineer pass (2026-08-25) — CI/lockfile/scheduler delivered, two findings for you
+
+Full detail lives in `.github/workflows/ci.yml`'s own job comments and `app/core/scheduler.py`'s
+module docstring — this section only records the two things that affect *this* doc's own content
+and need a `developer`/`database-architect` follow-up, not a devops-engineer one.
+
+1. **`RateLimitHit.ip` model/migration drift, found by the new `TEST_DB_SCHEMA_SOURCE=alembic`
+   CI job** (kept non-blocking, `continue-on-error: true`, specifically because of this): migration
+   0006 changes the column to native `INET`, but `app/models/rate_limit.py:36` still declares
+   `ip: Mapped[str] = mapped_column(String, ...)`. Every rate-limit-gated endpoint request against
+   an Alembic-migrated schema fails with `operator does not exist: inet = character varying`
+   (confirmed the single root cause of all ~60 failures that mode produces — every other test
+   passes). Fix is `RateLimitHit.ip` → `sqlalchemy.dialects.postgresql.INET`, `developer`/
+   `database-architect` territory, not applied here.
+2. **`docs/database/sql/provision_db_roles.sql`'s DML-grant block assumes the 4 tables already
+   exist** (fine for the "fresh baseline-only cutover" scenario it documents, i.e. a `create_all`'d
+   dev/test DB being cut over) — but the same gap would hit a genuinely greenfield staging/production
+   deploy that never ran `create_all` first. CI works around this with a narrower bootstrap subset
+   (`scripts/ci/role_separation_bootstrap.sql`, schema-level grants only, then lets migration 0007
+   supply the DML grant once tables exist) — worth deciding whether `provision_db_roles.sql` itself
+   should be split the same way for a real greenfield cutover, or whether every real deploy is
+   guaranteed to go through a `create_all`'d environment first. Not decided here.
+
+Also fixed in passing (blocked `alembic upgrade` entirely, in any environment, not just CI):
+`alembic/env.py`'s placeholder-`Settings` block predated `ENVIRONMENT` (OBJ-004, no default) —
+added `os.environ.setdefault("ENVIRONMENT", "development")` alongside the existing placeholders.
