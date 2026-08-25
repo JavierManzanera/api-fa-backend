@@ -24,7 +24,8 @@ migration 0008 is written but NOT SAFE TO DEPLOY past 0007 until `developer` reo
 handler. Jump to: "1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role
 separation", "4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item",
 "7. Gate-1 open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration
-authorship", "CRITICAL finding", "Environment blocker: greenlet".
+authorship", "CRITICAL finding", "Environment blocker: greenlet", "devops-engineer pass
+(2026-08-25)", "database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)".
 
 **Backlog items covered, traced to their source** (all read directly from
 `.ai-context/dependency_graph.md`'s OBJ-006 row and the OBJ-001/002/003 database-architect review
@@ -625,3 +626,66 @@ and need a `developer`/`database-architect` follow-up, not a devops-engineer one
 Also fixed in passing (blocked `alembic upgrade` entirely, in any environment, not just CI):
 `alembic/env.py`'s placeholder-`Settings` block predated `ENVIRONMENT` (OBJ-004, no default) —
 added `os.environ.setdefault("ENVIRONMENT", "development")` alongside the existing placeholders.
+
+## database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)
+
+**Decision made** (this doc's own prior section left it explicitly undecided, point 2 above):
+`docs/database/sql/provision_db_roles.sql` is now split the same way as
+`scripts/ci/role_separation_bootstrap.sql` — the script does role creation +
+cluster/schema-level grants ONLY. The DML-grant block (`GRANT SELECT, INSERT, UPDATE, DELETE ...`
++ `ALTER DEFAULT PRIVILEGES`) that previously lived inline in the script, and silently assumed the
+4 app tables already existed, is removed entirely — that behavior is already correctly supplied by
+migration `0007_grant_dml_role_privileges`, which grants once the tables actually exist, whether
+they got there via the Alembic chain from empty (greenfield) or already existed from a prior
+`create_all` (baseline-only cutover). No logic is duplicated between the two files; the script's
+own header comment now documents this explicitly, including the required run order
+(`provision_db_roles.sql` → `alembic upgrade head`, or `alembic stamp 0001_baseline_current_schema`
+first for a cutover of an already-`create_all`'d database).
+
+**Verification** — disposable local Postgres (`C:\Program Files\PostgreSQL\16\bin`, `initdb`/
+`pg_ctl`, ports 5490/5491 confirmed free of conflicts with other concurrent worktree activity
+before use, both clusters torn down + data dirs deleted after):
+
+- **Greenfield (empty DB, no tables) — PASS.** `provision_db_roles.sql` run against a brand-new
+  empty database, then `alembic upgrade head` end to end (0001 through 0008) as `fa_migrator`, zero
+  errors. Final privileges confirmed via `\dp` on all 4 tables: `fa_app=arwd` (SELECT/INSERT/
+  UPDATE/DELETE only, no DDL), `fa_migrator` full owner rights — exactly the intended split.
+- **Already-created (`create_all`'d) cutover — PASS, no regression for the documented scenario.**
+  `provision_db_roles.sql` itself still runs cleanly (no errors) against a database that already
+  has the 4 tables, same as before the fix. Following the documented cutover path
+  (`alembic stamp 0001_baseline_current_schema` then `alembic upgrade head`) through migration 0007
+  and confirming final privileges required a one-time `ALTER TABLE ... OWNER TO fa_migrator` on the
+  4 pre-existing tables first — see "new finding" below for why. With that done, migration 0007
+  applied cleanly and `\dp` showed identical final privileges to the greenfield case.
+
+**New finding, out of OBJ-011's scope, flagged for whoever eventually runs a real cutover**: a
+database whose tables were created by `Base.metadata.create_all` under a single pre-existing role
+(e.g. local `postgres` superuser) is NOT automatically owned by the newly-created `fa_migrator`
+role — `CREATE ROLE` doesn't transfer ownership of anything. Running the documented
+`alembic stamp` + `alembic upgrade head` cutover path as `fa_migrator` against such a database fails
+partway through with `psycopg2.errors.InsufficientPrivilege: must be owner of index
+ix_verifications_email` (migration 0002's `DROP INDEX`) — cleanly rolled back, `alembic_version`
+left at the prior stamp, no partial damage, but upgrade does not proceed until an operator runs
+something like `ALTER TABLE <table> OWNER TO fa_migrator` (or `REASSIGN OWNED BY <old_role> TO
+fa_migrator`, blocked here only because the old role was the cluster superuser `postgres`, which
+Postgres refuses to reassign away from since it also owns system objects) on the pre-existing
+tables first. This is unrelated to the DML-grant-block gap this pass fixed — it would occur
+regardless, for ANY cutover-to-role-separation of a pre-existing database, both before and after
+this fix — and is not something `provision_db_roles.sql` can address on its own (it doesn't know
+what role currently owns the tables). Not fixed here; flagging for the eventual real
+staging/production cutover runbook, same treatment the two devops-engineer findings above got.
+
+**Also hit and worked around during verification, unrelated to both the above**: migration 0006
+(`rate_limit_hit_ip_to_inet`)'s pre-DDL validation query (`ip !~ '^[0-9a-fA-F:.]+$'`) assumes
+`rate_limit_hits.ip` is still `character varying` at that point, but `app/models/rate_limit.py:36`
+already declares it `INET` (fixed since the devops-engineer finding #1 above was recorded — not
+re-verified further here, out of scope), so a freshly-`create_all`'d cutover database already has
+an `inet` column and the regex validation query fails with `operator does not exist: inet !~
+unknown`. Worked around for this verification by `alembic stamp 0006_rate_limit_hit_ip_inet`
+(schema already matches that migration's end state) before proceeding to 0007 — the actual target
+of this verification pass. Flagging, not fixing: this is migration 0006's own idempotency gap
+against an already-INET column, unrelated to role provisioning.
+
+Files changed: `docs/database/sql/provision_db_roles.sql` (header comment rewritten, DML-grant
+block removed). No changes to `alembic/versions/0007_grant_dml_role_privileges.py` or
+`scripts/ci/role_separation_bootstrap.sql` — both already correct, used as-is/as precedent.

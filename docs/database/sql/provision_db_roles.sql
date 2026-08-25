@@ -1,8 +1,8 @@
 -- OBJ-006: DDL/DML role separation (audit-report.md finding #14).
--- Illustrative provisioning script -- NOT wired into Alembic, NOT run
--- automatically by any code path yet. See obj-006-migration-plan.md
--- "DDL vs. DML role separation" for the full design and the local-dev-vs-
--- real-deployment split.
+-- Provisioning script -- NOT wired into Alembic, NOT run automatically by
+-- any code path yet. See obj-006-migration-plan.md "DDL vs. DML role
+-- separation" for the full design and the local-dev-vs-real-deployment
+-- split.
 --
 -- Deliberately kept OUT of Alembic's migration history: CREATE ROLE is a
 -- cluster-level (not database-level) operation, typically requires
@@ -14,10 +14,33 @@
 -- operator with superuser/CREATEROLE rights, before the first
 -- `alembic upgrade head` against that environment.
 --
--- Grants (as opposed to role creation) for the existing 4 tables are instead
--- proposed as a real Alembic migration (0007 in obj-006-migration-plan.md,
--- not authored yet -- Phase 1 design only) so future migrations that add new
--- tables can extend them automatically via ALTER DEFAULT PRIVILEGES below.
+-- GREENFIELD-SAFE BY DESIGN (fixed 2026-08-25, OBJ-011): this script does
+-- role creation + cluster/schema-level grants ONLY -- it does NOT grant DML
+-- on the 4 app tables, and does NOT assume those tables already exist.
+-- DML grants (SELECT/INSERT/UPDATE/DELETE on users, verifications,
+-- rate_limit_hits, refresh_sessions) plus the ALTER DEFAULT PRIVILEGES
+-- future-proofing are supplied by Alembic migration
+-- `0007_grant_dml_role_privileges`, which runs after this script as part of
+-- `alembic upgrade head` and grants once the tables actually exist --
+-- whether they got there via this migration chain from empty (a genuine
+-- greenfield deploy) or already existed from a prior `create_all` (the
+-- baseline-only cutover scenario this script originally documented). Either
+-- way, the correct order is:
+--   1. psql -v migrator_password=... -v app_password=... -f provision_db_roles.sql
+--   2. alembic upgrade head   (or `alembic stamp 0001_baseline_current_schema`
+--      first, if cutting over a database that already has the 4 tables from
+--      `create_all`, then `alembic upgrade head` from there)
+-- This mirrors the pattern already proven in CI's
+-- `scripts/ci/role_separation_bootstrap.sql`, which does the identical
+-- schema-level-grants-only split for the same reason (a throwaway CI
+-- Postgres always starts empty). Previously this script also carried an
+-- inline DML-grant block guarded as "for standalone use against an
+-- environment that hasn't run Alembic migrations yet" -- that block
+-- silently assumed the 4 tables already existed and failed outright
+-- (`ERROR: relation "users" does not exist`) against a true greenfield
+-- database. Removed as redundant with, and narrower than, what migration
+-- 0007 already does correctly for both scenarios -- see
+-- obj-006-migration-plan.md's OBJ-011 addendum for verification detail.
 
 -- --- One-time role creation (superuser) ---------------------------------
 
@@ -37,21 +60,20 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT ON DATABASE :"target_db" TO fa_app;
 GRANT USAGE ON SCHEMA public TO fa_app;
 
--- --- DML grants on the 4 existing tables (superseded by migration 0007 once
---     that lands -- kept here too so this script is usable standalone against
---     an environment that hasn't run Alembic migrations yet, e.g. a fresh
---     baseline-only cutover). ---
-GRANT SELECT, INSERT, UPDATE, DELETE ON users, verifications, rate_limit_hits, refresh_sessions TO fa_app;
-
--- Future-proofing: any table fa_migrator creates from here on automatically
--- grants DML to fa_app, so migration authors never have to remember a manual
--- GRANT step per new table.
-ALTER DEFAULT PRIVILEGES FOR ROLE fa_migrator IN SCHEMA public
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO fa_app;
-
+-- --- DML grants + ALTER DEFAULT PRIVILEGES: intentionally NOT here -------
+--
+-- Supplied by Alembic migration 0007_grant_dml_role_privileges instead,
+-- which runs GRANT SELECT, INSERT, UPDATE, DELETE ON users, verifications,
+-- rate_limit_hits, refresh_sessions TO fa_app, plus the equivalent
+-- ALTER DEFAULT PRIVILEGES FOR ROLE fa_migrator IN SCHEMA public future-
+-- proofing for tables created by later migrations. Run `alembic upgrade
+-- head` (see header comment above) immediately after this script to apply
+-- those grants -- do not duplicate them here, and do not skip that step.
+--
 -- fa_app must NOT be able to alter/drop the tables it operates on. No
--- explicit REVOKE needed here beyond what's already true by default: DML
--- grants above never included ALTER/DROP/TRUNCATE/REFERENCES/TRIGGER, and
--- fa_app was never made the owner of any table (fa_migrator is, implicitly,
--- as the role that CREATEs them) -- ownership is what would grant those
--- rights implicitly, and fa_app has none.
+-- explicit REVOKE is needed for that beyond what's already true by
+-- default: the DML grants migration 0007 issues never include
+-- ALTER/DROP/TRUNCATE/REFERENCES/TRIGGER, and fa_app is never made the
+-- owner of any table (fa_migrator is, implicitly, as the role that
+-- CREATEs them via Alembic) -- ownership is what would grant those rights
+-- implicitly, and fa_app has none.
