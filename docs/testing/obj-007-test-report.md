@@ -12,7 +12,10 @@ import/collection errors; live execution blocked by the same documented Postgres
 environment gap OBJ-005 hit (no live test DB in this session — devops-engineer's domain to
 provision, not self-provisioned here). Correctness verified instead by direct reading of every new
 assertion against the current (pre-OBJ-007) `app/api/v1/endpoints/auth.py` register handler — see
-"Verification method" below for the full per-test trace.
+"Verification method" below for the full per-test trace. **2026-08-25 addendum:** live-confirmed
+against a real test Postgres — 14 failed / 3 passed, matching every per-test prediction below
+exactly; one test-authoring bug found and fixed in the process (not an implementation-gap finding)
+— see "Live confirmation — 2026-08-25" at the end of this file.
 
 **Jump to:** "Phase 2 (red phase) — 2026-08-25" — the 3 files touched, what each new/changed test
 asserts, out of scope · "Verification method" — why live execution wasn't possible, and the
@@ -159,3 +162,55 @@ executed red run, which is a materially weaker form of verification than OBJ-005
 (live 244/244) and should not be treated as equivalent.
 
 **Gate 2: awaiting user approval.**
+
+## Live confirmation — 2026-08-25
+
+The recommendation above has now been carried out. A disposable test Postgres became reachable at
+`TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5433/api_fa_test` (provisioned by
+devops-engineer, outside this pass's scope — connectivity was verified with a plain `SELECT 1`
+before running anything). All three touched scopes were run live, exactly as named:
+`tests/api/test_register_email_verification.py`,
+`tests/api/test_timing_side_channel.py::TestRegisterConstantTimeGuarantee`,
+`tests/api/test_audit_logging.py::TestRegisterEvent`.
+
+**Result: 17 collected, 14 failed / 3 passed** — an exact match, test-for-test, to the "Verification
+method" section's predictions above:
+
+- All 7 top-level new-account tests in `test_register_email_verification.py` and all 6
+  `TestDuplicateEmailAntiEnumeration` tests failed on the predicted `assert 201 == 200` /
+  `assert 400 == 200` / `assert 400 == 503` lines — clean status-code assertions, current code's
+  `201`/`400` contract, nothing else.
+- The 3 predicted-green anchors (`test_register_rolls_back_entirely_when_email_send_fails`,
+  `test_register_503_response_shape`, `test_register_missing_password_returns_422`) passed, as
+  predicted.
+- Both `TestRegisterConstantTimeGuarantee` tests failed on the predicted `resp.status_code == 200`
+  line (`201`/`400` today).
+- Both `TestRegisterEvent` tests failed on the predicted `resp.status_code == 200` line; the
+  internal audit log `outcome` field (`"success"`/`"duplicate"`) logs correctly underneath, exactly
+  as designed — confirmed via captured log output, not just read.
+
+**One test-authoring bug found and fixed, not an implementation-gap finding:**
+`TestDuplicateEmailAntiEnumeration::test_new_and_duplicate_503_bodies_are_identical` initially
+crashed with `sqlalchemy.exc.MissingGreenlet` instead of failing on a clean assertion — a different
+failure shape than every other test in this pass, so per this pass's mandate it was tracked down
+rather than accepted at face value. Root cause: the test reads `user.email` (an ORM attribute) for
+its second `_register()` call *after* the first `_register()` call's 503 path makes the app run
+`await db.rollback()` (`app/api/v1/endpoints/auth.py` line 254) on the same shared `db_session` the
+`user` fixture object lives in (`deps.get_db` is overridden per `tests/conftest.py`). SQLAlchemy's
+`rollback()` unconditionally expires every object in the session — unlike `commit()`, this is not
+gated by `expire_on_commit=False` — so the later `user.email` access needs an implicit lazy-reload,
+which requires an active greenlet context that a plain (non-awaited) attribute read in test code
+doesn't have. Fixed by capturing `dup_email = user.email` as a plain `str` before the first
+`_register()` call, so no post-rollback attribute access occurs. This bug is orthogonal to OBJ-007's
+implementation status — it would have recurred identically at Gate 3 after `developer`'s fix
+regardless, silently turning a real assertion into a crash. After the fix, this test fails cleanly
+on `assert new_resp.status_code == dup_resp.status_code == 503` → `503 == 400`
+(`new_resp` correctly 503 today, since the new-account rollback path is unchanged by OBJ-007;
+`dup_resp` is 400, today's un-fixed duplicate branch) — matching the original prediction's intent
+exactly. Changed file: `tests/api/test_register_email_verification.py` (this fix only; no other
+test in the file needed it — this is the only test in the pass that reads an ORM attribute after an
+intervening rollback-inducing call).
+
+No test in this live pass failed due to an import error, a missing/broken fixture, or any reason
+other than the documented `201`/`400`-vs-`200` (or `400`-vs-`503`) contract gap this objective's
+`developer` pass needs to close. Genuinely red, for the right reasons, confirmed live.

@@ -403,9 +403,20 @@ class TestDuplicateEmailAntiEnumeration:
         user, _ = await user_factory(email="register-503-parity@example.com")
         failing_sender = _RecordingEmailSender(raise_error=True)
         _override_email_sender(failing_sender)
+        # Captured up front, as a plain str, before the first _register()
+        # call below: that call's 503 path makes the app call db.rollback()
+        # on the SAME shared db_session this `user` was created in (deps.
+        # get_db is overridden to yield it), and SQLAlchemy's rollback()
+        # unconditionally expires every object in the session (unlike
+        # commit(), this is NOT gated by expire_on_commit=False -- see
+        # tests/conftest.py's db_session fixture). A later `user.email`
+        # attribute access would then need to lazy-reload outside of any
+        # awaited/greenlet context and raise sqlalchemy.exc.MissingGreenlet
+        # -- confirmed live 2026-08-25, see obj-007-test-report.md addendum.
+        dup_email = user.email
 
         new_resp = await _register(client, api_prefix, "register-503-parity-new@example.com")
-        dup_resp = await _register(client, api_prefix, user.email)
+        dup_resp = await _register(client, api_prefix, dup_email)
 
         assert new_resp.status_code == dup_resp.status_code == 503
         assert new_resp.json() == dup_resp.json(), (
