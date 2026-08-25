@@ -15,13 +15,17 @@ assertion against the current (pre-OBJ-007) `app/api/v1/endpoints/auth.py` regis
 "Verification method" below for the full per-test trace. **2026-08-25 addendum:** live-confirmed
 against a real test Postgres — 14 failed / 3 passed, matching every per-test prediction below
 exactly; one test-authoring bug found and fixed in the process (not an implementation-gap finding)
-— see "Live confirmation — 2026-08-25" at the end of this file.
+— see "Live confirmation — 2026-08-25" at the end of this file. **Gate 3 (2026-08-25, same day):**
+developer's commit 93e9017 verified live — targeted 17/17 passed, full suite 262/262 passed, zero
+regressions, zero new test-authoring fixes needed. Verdict: PASS. See "Gate 3 verification —
+2026-08-25" at the very end.
 
 **Jump to:** "Phase 2 (red phase) — 2026-08-25" — the 3 files touched, what each new/changed test
 asserts, out of scope · "Verification method" — why live execution wasn't possible, and the
 per-test reasoning proving each assertion fails for the right reason today · "Deliberately skipped:
 live timing measurement" — why §3's bcrypt-hash parity requirement is tested via call-count spy,
-not wall-clock.
+not wall-clock · "Gate 3 verification — 2026-08-25" — post-implementation live pass, PASS verdict,
+full suite regression check.
 
 ## Phase 2 (red phase) — 2026-08-25
 
@@ -214,3 +218,45 @@ intervening rollback-inducing call).
 No test in this live pass failed due to an import error, a missing/broken fixture, or any reason
 other than the documented `201`/`400`-vs-`200` (or `400`-vs-`503`) contract gap this objective's
 `developer` pass needs to close. Genuinely red, for the right reasons, confirmed live.
+
+## Gate 3 verification — 2026-08-25
+
+**Verdict: PASS.** `developer`'s commit `93e9017` (`app/api/v1/endpoints/auth.py`'s `register()`
+split into `_handle_new_email_registration` / `_handle_duplicate_email_registration`) closes the
+anti-enumeration gap this objective exists to fix. Ran live against the same disposable test
+Postgres named in this session's dispatch (`TEST_DATABASE_URL=postgresql+asyncpg://test:test@
+localhost:5433/api_fa_test`, `create_all` schema mode, no devops/env work performed here beyond
+setting the two env vars already provisioned for this session).
+
+**Targeted scope** (the three files/classes named in the dispatch):
+`tests/api/test_register_email_verification.py` + `tests/api/test_timing_side_channel.py::
+TestRegisterConstantTimeGuarantee` + `tests/api/test_audit_logging.py::TestRegisterEvent` — **17
+collected, 17 passed, 0 failed.** Exactly the 17 tests this file predicted red in the "Live
+confirmation — 2026-08-25" section above are now green: all 7 new-account tests, all 6
+`TestDuplicateEmailAntiEnumeration` tests, both `TestRegisterConstantTimeGuarantee` tests, both
+`TestRegisterEvent` tests. In particular `test_response_is_identical_for_new_and_duplicate_email`
+and `test_new_and_duplicate_503_bodies_are_identical` (the two tests directly proving the
+enumeration oracle is closed, via body-equality rather than independently-checked status codes)
+both pass — confirms this isn't a trivial/coincidental green (e.g. both branches independently
+returning `200`/`503` with different bodies would still fail these two).
+
+**Full suite** (regression check, not scoped to this objective): **262 collected, 262 passed, 0
+failed**, 106.10s. No regression anywhere else in the codebase from the `register()` refactor.
+
+**Read-check on the implementation** (`app/api/v1/endpoints/auth.py`): `register()` (lines
+221-252) now dispatches to `_handle_duplicate_email_registration` (lines 295-319) or
+`_handle_new_email_registration` (lines 255-292) *before* any response is built; both helpers
+return the identical `{"msg": GENERIC_REGISTRATION_MESSAGE}` (module-level constant, line 50) —
+matches design notes §1's single-response-shape requirement structurally, not just per-test.
+
+**No test-authoring fixes needed this round** — the one fix from the prior live-confirmation pass
+(`test_new_and_duplicate_503_bodies_are_identical`'s pre-rollback `dup_email` capture) already
+covered the only ORM-attribute-after-rollback hazard in this file; nothing new surfaced.
+
+**Out of scope, unchanged from Phase 2:** live wall-clock timing measurement, exact duplicate-email
+notification wording, `/register` rate limiting, DB query-count symmetry between branches — see
+"Out of scope" above, none of these are gaps in this Gate 3 pass, they were never in scope.
+
+**Flaky/environment risk:** none observed. The suite is fully deterministic against a real
+Postgres with `create_all`-based schema; no timing-based assertions, no flaky markers triggered in
+this run.
