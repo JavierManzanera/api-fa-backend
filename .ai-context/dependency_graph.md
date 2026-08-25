@@ -46,7 +46,7 @@ user, not on any other objective's code.
 | OBJ-002 | `/logout`+revocation; refresh rotation+reuse detection; `token_version` invalidation | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `33b7aa0`) | audit-report.md #3 |
 | OBJ-003 | OTP HMAC-at-rest; TLS to Postgres; timing side-channel mitigation | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED** (commit `5ce5e2c`) | audit-report.md #5, #7, #8 |
 | OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | **CLOSED** (commit `bcd058f`) | audit-report.md #9, #10, #13 |
-| OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | Phase 2 done, **Gate 2 awaiting approval** | audit-report.md #11 |
+| OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `8ea1294`) | audit-report.md #11 |
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | database-architect piece DONE; devops-engineer piece **not started** | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
 
@@ -107,50 +107,16 @@ OTP seam for OBJ-005: `app.core.notifications.send_otp_notification(email, otp, 
 
 ## OBJ-005 — Email Verification Flow
 
-Status: Gate 2 approved (2026-08-25) | Phase 3 implementation done (developer, 2026-08-25) |
-**Gate 3 verification in progress** (qa-engineer ∥ security-specialist dispatched) | Agent chain:
-business-analyst → solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist
+Status: CLOSED (commit `8ea1294`) | Agent chain: business-analyst → solution-architect →
+qa-engineer → developer → qa-engineer ∥ security-specialist → developer (2 MEDIUM fixes) →
+qa-engineer ∥ security-specialist (re-verify)
 Docs: requirements=`docs/requirements/obj-005-email-verification-flow.md` ·
-design=`docs/api/obj-005-design-notes.md` · tests=`docs/testing/obj-005-test-report.md`
-Gate 1 decisions (APPROVED 2026-08-23): login enforcement = block unverified users (Option A) ·
-token mechanism = reuse existing 6-digit OTP infra (`Verification.purpose="email_verification"`),
-chosen **over** business-analyst's own recommendation of a long random link-token, to minimize new
-surface area · email send failure = fail the registration (rollback, `503`) · resend endpoint =
-reuse existing rate-limit/cooldown infra · login/refresh `is_verified` enforcement mechanics =
-distinguishable `400 "Email not verified"`, adopted 2026-08-24 without a separate ask (extends the
-already-Gate-3-reviewed `is_active` precedent by one predicate, doesn't reopen finding #5).
-Phase 3 (developer, 2026-08-25): new `app/core/email/` package (`EmailSender` ABC + `EmailSendError`
-in `base.py`, `ConsoleEmailSender` in `console.py`, template renderers in `templates.py`) wired via
-`Depends(deps.get_email_sender)`; `POST /auth/verify-email` + `POST /auth/resend-verification-email`
-added; `/auth/register` creates an `email_verification` row and sends via `EmailSender`, rolling
-back + `503` on `EmailSendError`; `/auth/login` + `/auth/refresh` gain the `is_verified` check.
-`tests/factories.py`'s `create_user` default flipped `is_verified` False→True (the flagged
-cross-cutting fix, landed in this pass). Full suite: 40 failed/204 passed → **244/244 passed**,
-zero regressions. Deviation from design §4.1: `app/core/notifications.py` (OBJ-004's seam) was
-kept, NOT retired/routed through `EmailSender` — three pre-existing green tests patch it directly
-by name; retiring it would have broken them. `/forgot-password` still uses the old seam;
-`EmailSender` is wired into `/register` + `/resend-verification-email` only, per what OBJ-005's own
-tests actually require.
-Open items: Gate 3: qa-engineer PASS (244/244, independently re-executed, `is_verified` default
-flip confirmed safe by reading not just green) + security-specialist PASS on finding #11 (genuinely
-closed, not bypassable) but **2 new MEDIUM findings from this objective's own additions** (neither
-reopens a closed finding, security-specialist says neither blocks Gate 3 sign-off): (1)
-`EMAIL_PROVIDER` has no fail-closed startup validation — a fork reaching `ENVIRONMENT=production`
-without configuring a real provider silently logs OTPs in plaintext via `ConsoleEmailSender`,
-reintroducing #10's exposure class; (2) `POST /auth/resend-verification-email` lacks the
-`verify_password_or_dummy` timing-parity call `/forgot-password` uses for finding #5, reopening a
-bounded email-existence/verification-status enumeration channel via response latency. **User
-decision (2026-08-25): fix both now in this same pass** — done: `developer` added
-`Settings.validate_email_provider_not_console_in_production` (`app/core/config.py`, fails startup
-on `ENVIRONMENT=="production"` + `EMAIL_PROVIDER=="console"`) and an unconditional
-`verify_password_or_dummy` call in `resend_verification_email` mirroring `/forgot-password`'s
-pattern, plus 11 new tests (`tests/unit/test_email_provider_startup.py` ×7,
-`TestResendVerificationEmailConstantTimeGuarantee` ×4 in `test_timing_side_channel.py`). Both
-findings confirmed genuinely red before the fix (temporarily reverted, reran, restored). Full
-suite: 244 → **255/255 passed**, zero regressions. Gate 3 round 2: qa-engineer PASS (255/255,
-independently re-run, both new test groups confirmed substantive) + security-specialist CLOSED on
-both findings (empirically confirmed via subprocess `Settings()` cases, symmetric — no
-over-blocking of legitimate configs). **OBJ-005 clear to close.**
+design=`docs/api/obj-005-design-notes.md` · tests=`docs/testing/obj-005-test-report.md` ·
+security=`audit-report.md` §"Gate 3 — Verificación OBJ-005"
+`EmailSender` abstraction (`app/core/email/`) wired into `/register` + `/resend-verification-email`;
+OBJ-004's `notifications.py` seam deliberately kept for `/forgot-password` (3 pre-existing tests
+patch it by name). Gate 3 round 1 surfaced 2 new MEDIUM findings (own additions, not regressions);
+fixed same pass, both independently re-confirmed CLOSED.
 
 ## OBJ-006 — Migrations & Supply Chain Hardening
 
@@ -187,7 +153,9 @@ with the user.
 - `33b7aa0` (2026-08-21) — OBJ-002 full slice.
 - `5ce5e2c` (2026-08-23) — OBJ-003 full slice.
 - `bcd058f` (2026-08-25) — OBJ-004 full slice (Gate 3: qa-engineer + security-specialist both PASS).
-- All four pushed to `origin/main` (verified 2026-08-25, see `CLAUDE.md` commit+push discipline).
+- `8ea1294` (2026-08-25) — OBJ-005 full slice (Gate 3, 2 rounds: 2 MEDIUM findings raised + fixed +
+  re-verified same pass, both closed).
+- All five pushed to `origin/main` (verified 2026-08-25, see `CLAUDE.md` commit+push discipline).
 
 ## Notes
 
@@ -196,13 +164,12 @@ with the user.
   before the reset still works). OBJ-002 closes the revocation gap.
 - OBJ-004/005/006 have no code overlap with OBJ-001/002/003 (different files: middleware/config vs.
   `auth.py`/`security.py`/`deps.py` vs. migrations) — safe to run their Phase 1s in parallel.
-- **Active cross-cutting blocker (2026-08-24): `greenlet` blocked by Windows Application Control.**
-  Independently discovered and confirmed by three separate agent passes (OBJ-004 qa-engineer, OBJ-005
-  qa-engineer, OBJ-006 database-architect) — `import greenlet` fails with `DLL load failed... An
-  Application Control policy has blocked this file`, 100% reproducible, not fixed by reinstalling the
-  package. Blocks every SQLAlchemy `AsyncSession`/`AsyncEngine` operation, i.e. the entire
-  `tests/api/**` suite and any async-DB code path, for every objective — not caused by any of the
-  three passes that found it. Plain sync SQLAlchemy (what Alembic itself uses) is unaffected.
-  **Must be resolved through a sanctioned channel before Phase 3/Gate 3 verification can complete
-  for OBJ-004, OBJ-005, or OBJ-006.** Tracked as the next thing to fix after the dependency-graph/
-  context-management cleanup (per user instruction, 2026-08-24).
+- **RESOLVED (2026-08-25): `greenlet`/Windows Application Control blocker from 2026-08-24.** User
+  rebooted the machine; `import greenlet` and the actual `greenlet_spawn` trampoline both confirmed
+  working again. No longer blocks async SQLAlchemy for any objective. `docker` is still not
+  installed/on PATH in this environment — Postgres for test runs is provisioned as a disposable
+  instance via the already-installed `C:\Program Files\PostgreSQL\16\bin` (`initdb`+`pg_ctl`, port
+  5433, `test`/`test`/`api_fa_test`), same pattern documented in `tests/README.md`'s original
+  environment note. Per `CLAUDE.md` directive #6, provisioning/tearing down this instance and
+  running the verification suite is `devops-engineer`/`qa-engineer`'s domain going forward, not the
+  orchestrator's — OBJ-004/005's Gate 3 passes both did this correctly.
