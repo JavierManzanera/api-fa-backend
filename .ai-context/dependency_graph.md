@@ -56,8 +56,8 @@ own timing-parity fix introduced. In progress 2026-08-25.
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | **CLOSED** (`c4c518b` + PR #1 merge `2bc6eb6`) | audit-report.md #12, #14 |
 | OBJ-007 | `/register` switches to generic anti-enumeration response (matches `/forgot-password`) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (PR #5 merged) | audit-report.md #6 |
 | — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | **CLOSED** (PR #4 merged) | audit-report.md #15 |
-| OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | In progress (developer dispatched) | audit-report.md #15 |
-| OBJ-009 | Rate limiting on `/register` (finding #16, DoS amplification) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | In progress (solution-architect dispatched) | audit-report.md §Gate 3 OBJ-007 |
+| OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | **CLOSED** (Gate 3 unanimous PASS, commit `1e597f5`, PR pending) | audit-report.md #15 |
+| OBJ-009 | Rate limiting on `/register` (finding #16, DoS amplification) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | Gate 2 done (`3aca16a`), blocked on shared-venv fix before developer | audit-report.md §Gate 3 OBJ-007 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
 
@@ -153,9 +153,9 @@ registered — no `User`/`Verification` row, no distinguishable timing (uncondit
 
 ## OBJ-009 — Rate limiting on `/register` (finding #16)
 
-Status: In progress (solution-architect dispatched) | Agent chain: solution-architect →
-qa-engineer → developer → qa-engineer ∥ security-specialist | Blocked by: none | Traces to:
-audit-report.md §"Gate 3 — Verificación OBJ-007" (finding #16)
+Status: Gate 2 red-phase done, ready for developer | Agent chain: solution-architect → qa-engineer →
+developer → qa-engineer ∥ security-specialist | Blocked by: shared-venv env drift (see Note below) |
+Traces to: audit-report.md §"Gate 3 — Verificación OBJ-007" (finding #16)
 Found by security-specialist during OBJ-007 Gate 3: `/register` still has no `enforce_rate_limit`
 call (pre-existing gap), and OBJ-007's own timing-parity fix now makes the duplicate-email branch
 pay a real bcrypt cost too (previously near-free) — the one remaining unauthenticated auth endpoint
@@ -164,9 +164,22 @@ Existing precedent to follow (not a novel design choice): `enforce_rate_limit(db
 limit)` is already used by `/forgot-password` (5/min), `/verify-otp` (10/min),
 `/resend-verification-email` (5/min), `/reset-password` (10/min) — `/register` is the outlier
 without one. `/resend-verification-email`'s 5/min is the closest analog (also email-triggering).
-Open items: Gate 1 (confirm the 5/min precedent + `429` OpenAPI addition), red tests, implementation,
-Gate 3.
-Commit: not yet pushed
+Gate 1: design notes committed (`98d0388`) — 5/min, single `enforce_rate_limit` call before the
+new/duplicate branch split, explicit "must not reopen enumeration via rate-limit side channel" list.
+Gate 2: `tests/api/test_register_rate_limit.py`, 6 tests (429-after-5, `Retry-After` header, window
+reset via freezegun, 422 regression guard, and 2 anti-enumeration checks: duplicate-only traffic
+also throttled, 429 body byte-identical regardless of branch) — collect-only clean, red-phase
+confirmed by static inspection (no `enforce_rate_limit` call yet in `register()`) rather than a live
+run; see Note below for why. `docs/testing/obj-009-test-report.md`.
+Note — env blocker hit during Gate 2: this branch (cut from `main` pre-OBJ-008) still imports
+`python-jose`, but the shared Python environment (used across all worktrees) currently has only
+`PyJWT` installed, left that way by the concurrent OBJ-008 migration work — suite-wide
+`ModuleNotFoundError: No module named 'jose'` on this branch, not caused by the new test file
+(reproduced identically against a pre-existing test). Needs `devops-engineer` (package
+install/env-isolation is its domain per directive #6) before `developer` can get this branch to a
+live green run.
+Open items: fix shared-venv drift, then developer implementation, then Gate 3.
+Commit: `3aca16a` on `obj-009-register-rate-limit`, pushed.
 
 ## Finding #15 remediation — `ALGORITHM` config guardrail
 
@@ -180,16 +193,15 @@ Fail-closed `field_validator` on `Settings.ALGORITHM` restricting it to `{"HS256
 
 ## OBJ-008 — Replace `python-jose` with `PyJWT[cryptography]`
 
-Status: In progress (developer dispatched) | Agent chain: developer → qa-engineer ∥
-security-specialist | Blocked by: none | Traces to: audit-report.md #15
-Rationale: removes `ecdsa` (and the suppressed `PYSEC-2026-1325` CVE) from the dependency tree
-entirely instead of reasoning about reachability indefinitely. security-specialist scoped it as
-~2 app files + 8 test files, near-identical API. No API contract change (still HS256-only,
-`ALGORITHM` validator from finding #15 stays) — pure library swap, no red-phase tests needed beyond
-the existing suite acting as the regression safety net; watch for PyJWT raising different exception
-types than `python-jose` on expired/invalid tokens, must still map to the same `401` responses.
-Open items: implementation, Gate 3.
-Commit: not yet pushed
+Status: **CLOSED** — Gate 3 unanimous PASS (qa-engineer 279/279 incl. 5 new algorithm-confusion
+tests it added closing a coverage gap; security-specialist no findings) — commits `99a0749`..
+`1e597f5` on branch `obj-008-pyjwt-migration`, not yet merged (PR pending)
+Docs: tests=`docs/testing/obj-008-test-report.md` · security=`audit-report.md` §"Gate 3 —
+Verificación OBJ-008 (2026-08-25)"
+`ecdsa`/`pyasn1`/`rsa`/`python-jose` fully removed from both lockfiles; `PyJWT[crypto]` in place;
+exception-mapping (`PyJWTError` catches) confirmed fail-closed 401, not 500, incl. algorithm-
+confusion cases. `pip-audit --ignore-vuln PYSEC-2026-1325` suppression dropped from CI (nothing left
+to ignore).
 
 ## Commits
 
