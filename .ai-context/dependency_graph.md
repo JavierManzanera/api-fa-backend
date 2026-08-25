@@ -45,7 +45,7 @@ user, not on any other objective's code.
 | OBJ-001 | JWT type confusion fix; OTP CSPRNG+lockout+rate-limit; `SECRET_KEY` validation | business-analyst → solution-architect ∥ security-specialist → qa-engineer → developer | **CLOSED** (commit `b733c17`) | audit-report.md #1, #2, #4 |
 | OBJ-002 | `/logout`+revocation; refresh rotation+reuse detection; `token_version` invalidation | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `33b7aa0`) | audit-report.md #3 |
 | OBJ-003 | OTP HMAC-at-rest; TLS to Postgres; timing side-channel mitigation | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED** (commit `5ce5e2c`) | audit-report.md #5, #7, #8 |
-| OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | Phase 2 done, **Gate 2 awaiting approval** | audit-report.md #9, #10, #13 |
+| OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | Gate 2 approved 2026-08-25; Phase 3 implementation done, **Gate 3 verification in progress** | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | Phase 2 done, **Gate 2 awaiting approval** | audit-report.md #11 |
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | database-architect piece DONE; devops-engineer piece **not started** | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
@@ -98,17 +98,29 @@ deploys relying on `require`/`verify-full`.
 
 ## OBJ-004 — HTTP Security Baseline
 
-Status: Phase 2 done (2026-08-24) | **Gate 2: awaiting user approval** | Agent chain:
-solution-architect → qa-engineer → developer
+Status: Gate 2 approved (2026-08-25) | Phase 3 implementation done (developer, 2026-08-25) |
+**Gate 3 verification in progress** (qa-engineer ∥ security-specialist dispatched) | Agent chain:
+solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist
 Docs: design=`docs/api/obj-004-design-notes.md` · tests=`docs/testing/obj-004-test-report.md`
 Gate 1 decisions (APPROVED 2026-08-23): CORS default origins = empty list (safe default) · CSP
 scope for `/docs`/`/redoc` = scoped CDN exemption (adopted, no genuine tradeoff — alternative
 breaks default Swagger UI) · OTP delivery interim seam = add the minimal monkeypatchable no-op now
 (adopted, low-stakes/reversible) · `X-Forwarded-For` trust = configurable `TRUSTED_PROXY_COUNT`,
 default `0`/untrusted (adopted).
-Open items: **environment blocker** — `greenlet` blocked by Windows Application Control, blocks 32
-of 79 new tests + 61 pre-existing DB-backed tests project-wide (see Notes below, same root cause as
-OBJ-006's identical finding). Must be resolved before Phase 3 verification can complete.
+Phase 3 (developer, 2026-08-25): 4 files modified (`auth.py`, `config.py`, `rate_limit.py`,
+`main.py`) + 3 new (`security_headers.py`, `audit_log.py`, `notifications.py`). Full suite:
+109 failed/135 passed → 40 failed/204 passed (244 total); the 40 remaining are pre-existing
+OBJ-005 red-phase tests, untouched. Zero regressions. OTP seam:
+`app.core.notifications.send_otp_notification(email: str, otp: str, *, purpose: str) -> None`,
+imported module-level in `auth.py` — patch target for tests is
+`app.api.v1.endpoints.auth.notifications.send_otp_notification`. One deviation from design notes:
+`BACKEND_CORS_ORIGINS` needed `Annotated[List[AnyHttpUrl], NoDecode]` (pydantic-settings 2.15
+quirk), not a bare `List[AnyHttpUrl]` — validator logic unchanged.
+Open items: environment blocker (`greenlet`/Windows Application Control) confirmed RESOLVED
+2026-08-25 (machine rebooted) — no longer blocking. Gate 3: qa-engineer PASS (40 failed/204 passed,
+independently confirmed, zero regressions) + security-specialist PASS (findings #9, #10, #13 all
+CLOSED, zero new findings, zero blockers). **Gate 3: awaiting user approval to commit+push and
+close.**
 
 ## OBJ-005 — Email Verification Flow
 

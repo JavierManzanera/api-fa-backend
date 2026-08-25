@@ -4,7 +4,20 @@
 `ENVIRONMENT`-gated docs, structured audit logging, OTP debug-print removal, `X-Forwarded-For`
 client IP) against `docs/api/obj-004-design-notes.md` — no business-analyst Gherkin doc for this
 infra/security objective, scenarios derived directly from design decisions per each file's own
-docstring (same convention as OBJ-003). **Gate 2: awaiting user approval.**
+docstring (same convention as OBJ-003). **Gate 3: PASS (2026-08-25)** — full suite independently
+re-run: 40 failed / 204 passed / 244 total, exactly matching developer's self-report; the 40
+failures are precisely the pre-existing OBJ-005 red-phase files (untouched); all previously-vacuous
+OBJ-004 tests (CORS middleware, docs-gating, wildcard-blocks-startup) now pass for the right
+reason; spot-checked assertions (HSTS/CSP, OTP-lockout WARNING level, CORS empty-default) are
+meaningful, not rubber-stamped. No regressions. See "Phase 3 (Gate 3 verification)" below for
+full detail.
+
+### Jump-to-index
+- "Phase 2 (red phase) — 2026-08-24" (line 18): original red-phase authoring, 79 new tests, 9
+  files, environment blocker (greenlet) and its impact on counts at that time.
+- "Phase 3 (Gate 3 verification) — 2026-08-25" (bottom): independent re-run confirming
+  developer's self-report, spot-checks of test intent vs. design notes, CORS
+  `NoDecode`/`Annotated` deviation check, final PASS verdict.
 
 **Environment blocker independently confirmed during this pass** (matches OBJ-006's identical
 finding, cross-checked, not a regression from this pass): `import greenlet` fails with
@@ -97,3 +110,96 @@ scope decision — required before Gate 3 can be met, this pass's counts don't s
    passing-for-the-right-reason once implemented, no test-file edits needed.
 
 **Gate 2: awaiting user approval.**
+
+## Phase 3 (Gate 3 verification) — 2026-08-25
+
+Independent verification of `developer`'s Phase 3 implementation, per this project's "confirm via
+disk/execution, don't just trust the self-report" discipline. Environment: disposable PostgreSQL
+16 at `localhost:5433` (test/test/api_fa_test), already running, reachable, untouched (shared with
+the parallel `security-specialist` dispatch). `import greenlet` confirmed working (3.5.5) — the
+Phase 2 blocker (Windows Application Control DLL block) is resolved as of today, not recurring.
+
+### What changed (per `git diff --stat`)
+Modified: `app/api/v1/endpoints/auth.py` (+104/-…), `app/core/config.py` (+65), `app/core/rate_limit.py`
+(+33), `app/main.py` (+46). New: `app/core/security_headers.py`, `app/core/audit_log.py`,
+`app/core/notifications.py`. Matches the file set named in the dispatch and the 6 task items in the
+design notes (CORS, security headers, ENVIRONMENT-gated docs, audit logging, OTP print removal,
+XFF client IP).
+
+### Full-suite run (`python -m pytest -q`, foreground, from repo root)
+**40 failed, 204 passed, 244 total in 90.81s.** Exactly matches developer's self-reported
+109→40 failed / 135→204 passed. (Total rose from 197 in the Phase 2 partial run to 244 here because
+the greenlet blocker that hid 93 tests behind a single traceback in Phase 2 is gone — every test now
+actually executes instead of erroring at collection/fixture time.)
+
+### Failure-set identity check
+All 40 failures map 1:1 onto the 6 pre-existing OBJ-005 red-phase files named in the dispatch, and
+nothing else:
+- `tests/api/test_login_refresh_verification_enforcement.py` — 3
+- `tests/api/test_register_email_verification.py` — 5
+- `tests/api/test_resend_verification_email.py` — 8
+- `tests/api/test_verification_purpose_isolation.py` — 3
+- `tests/api/test_verify_email.py` — 9
+- `tests/unit/test_email_sender.py` — 12
+
+3+5+8+3+9+12 = 40. Every failure traces to OBJ-005 surface not yet implemented (`Settings` has no
+`EMAIL_PROVIDER`/`EMAIL_FROM`, `app.core.email` module doesn't exist yet, etc.) — confirmed by
+reading the tracebacks, not just the file names. **Zero failures outside this set** — no
+regression introduced by the OBJ-004 implementation.
+
+### Spot-checks: test intent vs. design notes (not just pass/fail)
+1. **`tests/api/test_security_headers.py`** (`TestHstsHeader`, `TestContentSecurityPolicyHeader`)
+   vs. design notes §2 — confirmed meaningful: `test_hsts_does_not_include_preload` locks in the
+   deliberate no-`preload` decision (§2.1); `test_openapi_json_gets_strict_csp_not_docs_csp` guards
+   the one easy-to-miss case the design notes call out by name (`/openapi.json` must NOT get the
+   `/docs`/`/redoc` CDN-permissive CSP even though it's "docs-adjacent"); `test_docs_csp_still_restricts_frame_ancestors`
+   confirms the CDN exemption is scoped, not a blanket loosening. All read as targeted, not
+   tautological.
+2. **`tests/api/test_audit_logging.py::TestOtpLockoutEvent`** vs. design notes §4.2 — genuinely
+   non-trivial: `test_fifth_wrong_guess_logs_lockout_warning` first asserts the WARNING event does
+   **not** fire on attempts 1-4 (`_audit_events(caplog, "auth.otp.lockout") == []`), then asserts it
+   fires on exactly the 5th at `WARNING` level with the right `email` field. This is a real
+   boundary-condition test, not a rubber stamp. `app/core/audit_log.py`'s actual implementation
+   (`log_auth_event`, stdlib `logging` + JSON payload, `_logger.log(level, ...)`) matches the design
+   notes' illustrative code verbatim.
+3. **`tests/unit/test_cors_settings.py`** vs. design notes §1.1/§1.6 (Gate 1 Option A) — confirmed
+   the empty-default-is-safe decision survived implementation: `TestDefaultIsEmptyList::test_unset_defaults_to_empty_list`
+   passed in the full run (not in the 40 failures), independently proving `BACKEND_CORS_ORIGINS`
+   is `[]` when unset. `TestWildcardAndMalformedOriginsBlockStartup` (previously flagged vacuous in
+   Phase 2, since the field didn't exist) now also passes — re-ran this class plus
+   `test_cors_middleware.py`/`test_docs_gating.py`/`test_environment_settings.py`/
+   `test_client_ip.py`/`test_rate_limit_ip_spoofing.py` in isolation (63 tests) to confirm none are
+   passing for a leftover-vacuous reason: **63/63 passed**, all previously-vacuous cases now exercise
+   real behavior (a `CORSMiddleware` is actually installed, `/docs` is actually 404 in production,
+   `"*"` actually fails `Settings()` construction).
+
+### CORS `Annotated[List[AnyHttpUrl], NoDecode]` deviation — does NOT weaken Gate 1's safe-default
+`developer` added `NoDecode` (from `pydantic_settings`) to `BACKEND_CORS_ORIGINS`, not present in
+the design notes' illustrative snippet. Read `app/core/config.py`: the field is declared
+`Annotated[List[AnyHttpUrl], NoDecode] = []` — default is still the empty list literal, and the
+`@field_validator(..., mode="before")` comma-split logic is unchanged and still runs. `NoDecode`
+only opts the field out of pydantic-settings' default behavior of JSON-decoding complex-typed env
+values *before* the custom validator gets a chance to run — without it, a comma-separated
+(non-JSON) string would raise `SettingsError` before `assemble_cors_origins` ever executes. This is
+a mechanical fix for how pydantic-settings v2 parses `List[...]`-typed env vars, not a security
+posture change. Independently confirmed via test, not just code-reading:
+`test_unset_defaults_to_empty_list` (empty env → `[]`) and `TestWildcardAndMalformedOriginsBlockStartup`
+(literal `"*"` and a schemeless host both still fail `Settings()` construction) both pass. Gate 1's
+"empty list is a safe default, `*` cannot be expressed" decision is intact.
+
+### Verdict
+**PASS.** Counts match developer's self-report exactly, failure set is exactly the expected
+pre-existing OBJ-005 scope with zero unexplained regressions, spot-checked assertions are
+substantive, and the one implementation deviation from the design notes (`NoDecode`) is a
+non-weakening technical necessity, confirmed by both reading and independent test execution.
+
+### Out of scope for this pass
+Did not re-derive or re-review the 40 failing OBJ-005 tests' own correctness (that's OBJ-005's own
+red-phase report, `docs/testing/obj-005-test-report.md` if/when it exists) — only confirmed they are
+the same byte-identical pre-existing set, unaffected by this objective's changes.
+
+### Risks / flakiness notes
+None observed. Full suite ran deterministically in 90.81s against the real Postgres instance; no
+timing-sensitive or order-dependent failures seen. The subprocess-spawned tests (CORS/docs-gating/
+environment settings) remain a known environment cost (~30s of the runtime) but are necessary per
+Phase 2's singleton-config rationale, not a new risk.

@@ -1,5 +1,5 @@
-from typing import List
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated, List, Union
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import AnyHttpUrl, PostgresDsn, computed_field, field_validator
 from functools import lru_cache
 
@@ -10,6 +10,12 @@ MIN_SECRET_KEY_LENGTH = 32
 # matching (unlike SECRET_KEY's placeholder blocklist) -- design notes
 # section 2.1 does not specify one for this field.
 _VALID_POSTGRES_SSL_MODES = {"disable", "require", "verify-full"}
+
+# OBJ-004 finding #13 (obj-004-design-notes.md section 3): the three
+# environments this template's docs-gating (and any future
+# environment-aware behavior) branches on. Lowercase-exact, same
+# case-sensitivity convention as _VALID_POSTGRES_SSL_MODES.
+_VALID_ENVIRONMENTS = {"development", "staging", "production"}
 
 # Known-placeholder values that must never be used as a real SECRET_KEY,
 # compared case-insensitively (obj-001-design-notes.md section 3).
@@ -44,7 +50,62 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int
     REFRESH_TOKEN_EXPIRE_DAYS: int
 
+    # OBJ-004 finding #13 (obj-004-design-notes.md section 3): required, no
+    # default -- matching POSTGRES_SSL_MODE's "every environment must say
+    # what it wants" convention. Gates /docs, /redoc, /openapi.json (section
+    # 3) and is available for any future objective to branch on.
+    ENVIRONMENT: str
+
+    # OBJ-004 finding #9 (obj-004-design-notes.md section 1.1, Gate 1
+    # APPROVED Option A): browser origins allowed to call this API
+    # cross-origin. Empty-list default -- CORS closed until a fork opts in.
+    # List[AnyHttpUrl] (not List[str]) is a deliberate type-level choice: it
+    # cannot parse the literal string "*", closing audit finding #9's named
+    # fear ("allow_origins=['*']") at validation time, not just by
+    # convention. NoDecode opts this field out of pydantic-settings' default
+    # "complex fields are JSON-decoded from the env var" behavior -- without
+    # it, a comma-separated (non-JSON) env value raises a SettingsError
+    # before assemble_cors_origins below ever gets a chance to parse it.
+    BACKEND_CORS_ORIGINS: Annotated[List[AnyHttpUrl], NoDecode] = []
+
+    # OBJ-004 finding #9 addendum (obj-004-design-notes.md section 1.5):
+    # Host header allowlist for TrustedHostMiddleware. "*" preserves today's
+    # existing (no host validation) behavior by default.
+    ALLOWED_HOSTS: List[str] = ["*"]
+
+    # OBJ-004 finding #10 (obj-004-design-notes.md section 4.4): stdlib
+    # `logging` level for structured auth-event logs. A safe default --
+    # misconfiguration only affects log verbosity, never security posture.
+    LOG_LEVEL: str = "INFO"
+
+    # OBJ-004 backlog item (obj-004-design-notes.md section 6.2, Gate 1
+    # APPROVED Option A): how many trusted reverse proxies/load balancers
+    # sit in front of this app. 0 (default) = do not trust
+    # X-Forwarded-For at all -- the maximally safe default, and exactly
+    # today's existing (unconfigured) behavior.
+    TRUSTED_PROXY_COUNT: int = 0
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
+    def assemble_cors_origins(cls, value: Union[str, List[str]]):
+        """Comma-separated env var -> list, same convention this FastAPI
+        template family commonly uses (obj-004-design-notes.md section
+        1.1). A value that's already a list (or a JSON-array string) is
+        left alone for pydantic's own complex-type parsing to handle."""
+        if isinstance(value, str) and not value.startswith("["):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    @field_validator("ENVIRONMENT")
+    @classmethod
+    def validate_environment(cls, value: str) -> str:
+        if value not in _VALID_ENVIRONMENTS:
+            raise ValueError(
+                f"ENVIRONMENT must be one of {sorted(_VALID_ENVIRONMENTS)}, got {value!r}."
+            )
+        return value
 
     @field_validator("SECRET_KEY")
     @classmethod

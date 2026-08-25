@@ -1,3 +1,4 @@
+import logging
 import secrets
 import string
 import uuid
@@ -11,6 +12,8 @@ from sqlalchemy import select, delete, update
 from app.api import deps
 from app.core import security
 from app.core import rate_limit
+from app.core import audit_log
+from app.core import notifications
 from app.core.config import settings
 from app.models.user import User
 from app.models.verification import Verification
@@ -39,7 +42,7 @@ def _generate_otp() -> str:
     return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
-async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str) -> Verification:
+async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str, ip: str) -> Verification:
     """Validates `otp` against the live `reset_password` Verification row for
     `email`, sharing ONE failed-attempt budget between /verify-otp and
     /reset-password (audit finding #2 -- design notes section 2).
@@ -51,7 +54,11 @@ async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str) -> Veri
       MAX_OTP_ATTEMPTS the row is invalidated (expires_at pulled to "now")
       so it stops matching future "live row" lookups too. Same generic 400
       either way -- lockout, expiry, and wrong-code are indistinguishable
-      by design (no new oracle).
+      by design (no new oracle). Every wrong guess emits
+      `auth.otp.failed_attempt`; reaching the lockout threshold additionally
+      emits `auth.otp.lockout` at WARNING (OBJ-004 finding #10, design
+      notes section 4.2 -- both attempt tracking and lockout are genuine
+      audit-worthy events).
     - Live row, correct code -> returned to the caller to finish the
       business flow (verify-otp just reports success; reset-password also
       deletes it after use).
@@ -72,8 +79,22 @@ async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str) -> Veri
 
     if not security.verify_otp_hash(otp, verification.code):
         verification.attempts += 1
+        audit_log.log_auth_event(
+            "auth.otp.failed_attempt",
+            email=email,
+            ip=ip,
+            purpose=RESET_PASSWORD_PURPOSE,
+            attempts=verification.attempts,
+        )
         if verification.attempts >= MAX_OTP_ATTEMPTS:
             verification.expires_at = datetime.now(timezone.utc)
+            audit_log.log_auth_event(
+                "auth.otp.lockout",
+                level=logging.WARNING,
+                email=email,
+                ip=ip,
+                purpose=RESET_PASSWORD_PURPOSE,
+            )
         await db.commit()
         raise generic_error
 
@@ -142,12 +163,15 @@ async def read_current_user(
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(
+    http_request: Request,
     user_in: UserCreate,
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
+    ip = rate_limit.client_ip(http_request)
     result = await db.execute(select(User).filter(User.email == user_in.email))
     user = result.scalars().first()
     if user:
+        audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="duplicate")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="The user with this email already exists in the system.",
@@ -162,14 +186,17 @@ async def register(
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="success")
     return user
 
 
 @router.post("/login", response_model=Token)
 async def login(
+    http_request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
+    ip = rate_limit.client_ip(http_request)
     result = await db.execute(select(User).filter(User.email == form_data.username))
     user = result.scalars().first()
 
@@ -183,14 +210,21 @@ async def login(
         form_data.password, user.hashed_password if user is not None else None
     )
     if not credentials_valid:
+        audit_log.log_auth_event(
+            "auth.login.failure", email=form_data.username, ip=ip, reason="invalid_credentials"
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect email or password")
 
     if not user.is_active:
+        audit_log.log_auth_event(
+            "auth.login.failure", email=form_data.username, ip=ip, reason="inactive_user"
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
 
     new_family_id = uuid.uuid4()
     tokens = await _issue_tokens_and_session(db, user, family_id=new_family_id, jti=new_family_id)
     await db.commit()
+    audit_log.log_auth_event("auth.login.success", email=user.email, ip=ip, user_id=str(user.id))
     return tokens
 
 
@@ -200,10 +234,11 @@ async def forgot_password(
     payload: EmailRequest,
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
+    ip = rate_limit.client_ip(http_request)
     await rate_limit.enforce_rate_limit(
         db,
         scope="forgot_password",
-        ip=rate_limit.client_ip(http_request),
+        ip=ip,
         email=payload.email,
         limit=FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE,
     )
@@ -260,10 +295,18 @@ async def forgot_password(
     db.add(verification)
     await db.commit()
 
-    # MOCK EMAIL SENDER
-    print(f"============================================")
-    print(f" [EMAIL MOCK] To: {payload.email} | OTP: {otp} ")
-    print(f"============================================")
+    # OBJ-004 finding #10, part 2 (obj-004-design-notes.md section 5): the
+    # debug print is gone -- a non-secret-leaking audit-log line (email/ip/
+    # purpose only, never the raw OTP) plus the interim delivery seam, which
+    # is the ONLY place allowed to receive the raw OTP outside of generation
+    # and hashing.
+    audit_log.log_auth_event(
+        "auth.otp.requested",
+        email=payload.email,
+        ip=ip,
+        purpose=RESET_PASSWORD_PURPOSE,
+    )
+    notifications.send_otp_notification(payload.email, otp, purpose=RESET_PASSWORD_PURPOSE)
 
     return {"msg": GENERIC_OTP_SENT_MESSAGE}
 
@@ -274,15 +317,16 @@ async def verify_otp(
     payload: OTPVerifyRequest,
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
+    ip = rate_limit.client_ip(http_request)
     await rate_limit.enforce_rate_limit(
         db,
         scope="verify_otp",
-        ip=rate_limit.client_ip(http_request),
+        ip=ip,
         email=payload.email,
         limit=VERIFY_OTP_RATE_LIMIT_PER_MINUTE,
     )
 
-    await _check_and_consume_otp(db, payload.email, payload.otp)
+    await _check_and_consume_otp(db, payload.email, payload.otp, ip)
 
     return {"msg": "OTP verified successfully"}
 
@@ -293,15 +337,16 @@ async def reset_password(
     payload: PasswordResetRequest,
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
+    ip = rate_limit.client_ip(http_request)
     await rate_limit.enforce_rate_limit(
         db,
         scope="reset_password",
-        ip=rate_limit.client_ip(http_request),
+        ip=ip,
         email=payload.email,
         limit=RESET_PASSWORD_RATE_LIMIT_PER_MINUTE,
     )
 
-    verification = await _check_and_consume_otp(db, payload.email, payload.otp)
+    verification = await _check_and_consume_otp(db, payload.email, payload.otp, ip)
 
     result_user = await db.execute(select(User).filter(User.email == payload.email))
     user = result_user.scalars().first()
@@ -321,6 +366,7 @@ async def reset_password(
     )
     await db.delete(verification)
     await db.commit()
+    audit_log.log_auth_event("auth.password_reset.success", email=user.email, ip=ip, user_id=str(user.id))
 
     return {"msg": "Password updated successfully"}
 
@@ -339,13 +385,21 @@ def _parse_jti(raw_jti: Optional[str]) -> Optional[uuid.UUID]:
 
 @router.post("/refresh", response_model=Token)
 async def refresh_token(
+    http_request: Request,
     refresh_token: str = Body(..., embed=True),
     db: AsyncSession = Depends(deps.get_db)
 ) -> Any:
     """OBJ-002 rotation + reuse detection (design notes section 2). Every
     failure branch below raises the SAME generic 401 -- no oracle over
     which specific case (no row / reuse / expired / ver-mismatch) was hit.
+
+    OBJ-004 finding #10 (design notes section 4.2): every branch emits a
+    structured audit event -- `auth.refresh.failure` (ip, reason) for the
+    four rejection paths, `auth.refresh.reuse_detected` at WARNING
+    (possible token theft) for replay of an already-rotated token, and
+    `auth.refresh.success` on a clean rotation.
     """
+    ip = rate_limit.client_ip(http_request)
     invalid_token_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired refresh token",
@@ -363,6 +417,7 @@ async def refresh_token(
     if session_row is None:
         # Covers: forged/garbage jti, a purged row, AND every pre-OBJ-002
         # legacy token (no jti claim at all).
+        audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="no_session")
         raise invalid_token_exception
 
     now = datetime.now(timezone.utc)
@@ -374,19 +429,29 @@ async def refresh_token(
             db, RefreshSession.family_id == session_row.family_id, now=now
         )
         await db.commit()
+        audit_log.log_auth_event(
+            "auth.refresh.reuse_detected",
+            level=logging.WARNING,
+            user_id=str(session_row.user_id),
+            family_id=str(session_row.family_id),
+            jti=str(session_row.id),
+        )
         raise invalid_token_exception
 
     if session_row.expires_at < now:
         # Ordinary expiry -- NOT treated as reuse, no family action.
+        audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="expired")
         raise invalid_token_exception
 
     result_user = await db.execute(select(User).filter(User.email == email))
     user = result_user.scalars().first()
     if not user or not user.is_active:
+        audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="user_inactive")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User inactive or not found")
 
     if payload.get("ver") != user.token_version:
         # Password-reset invalidation (design notes section 3).
+        audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="ver_mismatch")
         raise invalid_token_exception
 
     new_jti = uuid.uuid4()
@@ -401,11 +466,19 @@ async def refresh_token(
     session_row.revoked_at = now
     session_row.replaced_by = new_jti
     await db.commit()
+    audit_log.log_auth_event(
+        "auth.refresh.success",
+        user_id=str(user.id),
+        family_id=str(session_row.family_id),
+        old_jti=str(jti),
+        new_jti=str(new_jti),
+    )
     return tokens
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
+    http_request: Request,
     refresh_token: str = Body(..., embed=True),
     db: AsyncSession = Depends(deps.get_db),
 ) -> None:
@@ -419,6 +492,10 @@ async def logout(
     missing the `refresh_token` field entirely is the one case that's a
     genuine schema failure (422), handled by FastAPI/Pydantic before this
     function ever runs.
+
+    OBJ-004 finding #10 (design notes section 4.2): emits `auth.logout`
+    with `jti` (nullable -- the no-op branch logs jti=null, never
+    fabricates a value) and `ip`.
     """
     # OBJ-003 (obj-003-design-notes.md section 3.3, OBJ-002 Gate 3 SAST
     # fold-in): the jti-is-None branch performs an equivalent-shaped no-op
@@ -435,4 +512,9 @@ async def logout(
     else:
         await db.execute(select(1))
     await db.commit()
+    audit_log.log_auth_event(
+        "auth.logout",
+        jti=str(jti) if jti is not None else None,
+        ip=rate_limit.client_ip(http_request),
+    )
     return None
