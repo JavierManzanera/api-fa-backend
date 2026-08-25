@@ -47,7 +47,7 @@ user, not on any other objective's code.
 | OBJ-003 | OTP HMAC-at-rest; TLS to Postgres; timing side-channel mitigation | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED** (commit `5ce5e2c`) | audit-report.md #5, #7, #8 |
 | OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | **CLOSED** (commit `bcd058f`) | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `8ea1294`) | audit-report.md #11 |
-| OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | database-architect piece DONE; devops-engineer piece **not started** | audit-report.md #12, #14 |
+| OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | Both pieces DONE (commit `c4c518b`); **new finding awaiting decision** (`RateLimitHit.ip` type mismatch) | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
@@ -120,11 +120,28 @@ fixed same pass, both independently re-confirmed CLOSED.
 
 ## OBJ-006 — Migrations & Supply Chain Hardening
 
-Status: database-architect piece DONE (2026-08-24, 8 Alembic migrations authored+verified);
-devops-engineer piece (CI/pip-audit/lockfile/role-creation/cleanup-scheduling) **not started** |
-Agent chain: database-architect → devops-engineer
+Status: database-architect piece DONE (2026-08-24); devops-engineer piece DONE (2026-08-25, commit
+`c4c518b`, pushed+verified) | Agent chain: database-architect → devops-engineer
 Docs: plan+migrations+handoff=`docs/database/obj-006-migration-plan.md` (includes the Gate 1
-approval and migration-authorship sections)
+approval, migration-authorship, and devops addendum sections)
+devops-engineer delivered: `.github/workflows/ci.yml` (4 jobs: dependency-audit, test,
+role-separation-smoke-test, test-alembic-schema-drift[advisory]) · pinned
+`requirements(-dev).txt` + generated `requirements(-dev).lock.txt` (finding #12) · `pip-audit`
+wired, one documented `--ignore-vuln` (unfixed upstream `python-ecdsa` PYSEC-2026-1325, pulled in
+by `python-jose`) · `app/core/scheduler.py` (APScheduler cleanup jobs per Gate-1 retention
+windows) · CI role-separation smoke test (finding #14). Every CI migration step targets `0007`
+explicitly, never `head`/`0008` — guardrail confirmed respected.
+**New finding from this pass, needs a decision:** `app/models/rate_limit.py`'s `RateLimitHit.ip`
+column is still ORM-typed `String`, but migration 0006 changed the actual DB column to native
+`INET` — confirmed as the single root cause of all 60 `test-alembic-schema-drift` CI failures
+(create_all mode, which most local dev used until now, is unaffected and fully green, which is why
+this was never caught before). **In a real Alembic-migrated deployment, every rate-limit-gated
+request would fail.** `devops-engineer` kept the CI job advisory/non-blocking rather than fixing it
+(out of their scope) or hiding it. Needs `developer`/`database-architect` to fix the model to match
+migration 0006. Secondary, lower-urgency note: `docs/database/sql/provision_db_roles.sql`'s DML
+grants assume the 4 tables already exist, which doesn't hold for a genuine greenfield DB — CI works
+around it with a narrower bootstrap subset; real operator script may need the same split for an
+actual staging/production cutover.
 Gate 1 decisions (APPROVED 2026-08-23): `rate_limit_hits` retention 1hr · `refresh_sessions`
 retention floor = 7 days (`REFRESH_TOKEN_EXPIRE_DAYS`, hard floor, not adjustable downward) ·
 cleanup scheduler = APScheduler over `pg_cron` · migration 0005 (timestamp convergence) kept ·
@@ -137,8 +154,10 @@ index defense (migration 0008) adopted.
 rotation once migrated to head. Validated fix (reorder to revoke→insert→link) documented in the
 migration plan doc. **Do not run `alembic upgrade head` — stop at `0007` — until `developer`
 reorders that handler.**
-Same `greenlet` environment blocker as OBJ-004/005 (see Notes) — full pytest suite against a
-migrated schema not yet directly verified.
+`greenlet` blocker (see Notes) confirmed resolved 2026-08-25 — full suite now verified in both
+modes: create_all = 255/255 green; `TEST_DB_SCHEMA_SOURCE=alembic` (stopping at 0007) = 60 failing,
+all traced to the single `RateLimitHit.ip` type-mismatch finding above, not a migration-authorship
+defect. Awaiting user decision on the finding above before OBJ-006 fully closes.
 
 ## OBJ-007 — Registration Enumeration Policy Decision
 
