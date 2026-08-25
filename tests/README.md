@@ -54,6 +54,41 @@ was worked around, and that service was never touched. `docker compose -f
 docker-compose.test.yml up -d` is the intended, supported path going
 forward.
 
+### Per-worktree/per-checkout venv (2026-08-25, devops-engineer)
+
+This project runs concurrent subagents on separate branches via `git
+worktree` (Claude Code's Agent tool `isolation: "worktree"` option). Until
+now everything (main checkout + every worktree) installed straight into
+the one global Python 3.11 interpreter's site-packages -- there was no
+per-project venv at all. That broke this branch
+(`obj-009-register-rate-limit`, cut before `obj-008-pyjwt-migration`
+merged, so its code still imports `python-jose`): a concurrent OBJ-008
+install had uninstalled `python-jose` globally in favor of `PyJWT`, so
+every test here errored with `ModuleNotFoundError: No module named
+'jose'` -- an environment artifact, not a real test failure.
+
+**Going forward: each checkout (main working dir, and each
+`.claude/worktrees/<agent-id>` worktree) gets its own `.venv`, built from
+that checkout's own `requirements.lock.txt` / `requirements-dev.lock.txt`**,
+not a shared/global interpreter. This worktree's own `.venv` was created
+this way (`python-jose` confirmed present, `PyJWT` absent, matching this
+branch's lockfiles) and a `pytest --collect-only` pass confirmed clean
+(280 tests collected, no `ModuleNotFoundError`):
+
+```
+python -m venv .venv
+.venv/Scripts/pip install -r requirements-dev.lock.txt   # Linux/Mac: .venv/bin/pip
+.venv/Scripts/python -m pytest --collect-only -q         # sanity check before running anything
+```
+
+`.venv/` is already covered by this repo's existing `.gitignore` pattern
+(`.venv/`, matches at any depth via git's relative-path matching, verified
+with `git check-ignore`); a worktree's `.venv` is additionally covered
+wholesale by the `.claude/worktrees/` ignore entry. No new gitignore
+entries were needed. This is a convention, not a CI change -- CI still
+builds its own single ephemeral environment per run from whichever
+branch's lockfiles, which was never affected by this issue.
+
 ## OBJ-002 pass (2026-08-21, qa-engineer, red phase)
 
 `tests/api/test_logout.py`, `test_refresh_rotation.py`,
