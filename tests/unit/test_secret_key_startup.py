@@ -47,6 +47,17 @@ BASE_ENV_FIELDS = {
     # See tests/unit/test_postgres_ssl_mode_startup.py for the dedicated
     # POSTGRES_SSL_MODE validation tests.
     "POSTGRES_SSL_MODE": "disable",
+    # OBJ-004 finding #13 (obj-004-design-notes.md section 3): ENVIRONMENT is
+    # a second new required-no-default field, added PROACTIVELY here for the
+    # exact same reason POSTGRES_SSL_MODE was added proactively during
+    # OBJ-003 -- without this line, the moment `developer` adds the field,
+    # every test below (including the ones proving a STRONG SECRET_KEY
+    # permits startup) would start failing for the unrelated reason of a
+    # third missing required env var, masking what SECRET_KEY-specific
+    # behavior is actually under test. See
+    # tests/unit/test_environment_settings.py for the dedicated ENVIRONMENT
+    # validation tests.
+    "ENVIRONMENT": "development",
 }
 
 

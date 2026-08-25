@@ -97,6 +97,21 @@ os.environ.setdefault("REFRESH_TOKEN_EXPIRE_DAYS", "7")
 # any test runs. "disable" (not "require"/"verify-full") because the
 # throwaway self-provisioned test Postgres has no TLS certs configured.
 os.environ.setdefault("POSTGRES_SSL_MODE", "disable")
+# OBJ-004 finding #13 (obj-004-design-notes.md section 3): ENVIRONMENT is a
+# new required Settings field, no default -- matching POSTGRES_SSL_MODE's
+# exact "every environment must say what it wants" convention, so it needs
+# the same conftest bootstrap treatment for the same reason (Settings() is
+# an eagerly-constructed module-level singleton; a missing required field
+# fails the whole suite at collection, before any test runs). "development"
+# (not "staging"/"production") because obj-004-design-notes.md section 3
+# gates /docs, /redoc, /openapi.json OFF only for "production" -- the
+# default here is chosen so the shared `client` fixture naturally exercises
+# the "docs reachable" path without a subprocess; the "docs gated off in
+# production" behavior is tested separately, per-process, in
+# tests/api/test_docs_gating.py (a different ENVIRONMENT value than this
+# suite-wide default cannot be exercised in-process, since Settings/app.main
+# are both module-level singletons constructed once at first import).
+os.environ.setdefault("ENVIRONMENT", "development")
 
 import pytest
 import pytest_asyncio
@@ -121,6 +136,25 @@ DB_BLOCKED_MESSAGE = (
     " or set TEST_DATABASE_URL to a Postgres you control.\n"
     "=================================================================\n"
 )
+
+
+# OBJ-006 (database-architect): which way should db_engine below put a
+# schema on TEST_DATABASE_URL before the suite runs? Two modes:
+#   - "create_all" (DEFAULT, unchanged behavior): Base.metadata.drop_all
+#     then create_all, exactly as every prior objective's passes have done.
+#     No setup needed beyond TEST_DATABASE_URL pointing at an empty/owned
+#     Postgres.
+#   - "alembic": skip drop_all/create_all entirely and assume the schema at
+#     TEST_DATABASE_URL was already provisioned by a real
+#     `alembic upgrade <rev>` run (see tests/README.md "Running against
+#     real Alembic migrations" for the exact commands). This is how you
+#     prove the migrations in alembic/versions/ produce a schema the
+#     existing test suite actually accepts, not just that `alembic upgrade
+#     head` runs without erroring.
+# devops-engineer: whether CI should run in "create_all" mode, "alembic"
+# mode, or both is flagged as your call in .ai-context/dependency_graph.md's
+# OBJ-006 database-architect section -- not decided here.
+TEST_DB_SCHEMA_SOURCE = os.environ.get("TEST_DB_SCHEMA_SOURCE", "create_all")
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
@@ -151,9 +185,22 @@ async def db_engine():
 
     engine = create_async_engine(TEST_DATABASE_URL, echo=False, future=True)
     try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
-            await conn.run_sync(Base.metadata.create_all)
+        if TEST_DB_SCHEMA_SOURCE == "alembic":
+            # Schema is already provisioned by an external `alembic upgrade`
+            # run against this same TEST_DATABASE_URL -- do NOT drop/create
+            # here (that would silently replace the migrated schema with
+            # the ORM's own create_all output, defeating the point). Just
+            # prove the connection is live so a misconfigured
+            # TEST_DATABASE_URL still fails loudly via DB_BLOCKED_MESSAGE
+            # instead of every test erroring on "relation does not exist".
+            from sqlalchemy import text
+
+            async with engine.begin() as conn:
+                await conn.execute(text("SELECT 1 FROM users LIMIT 1"))
+        else:
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.drop_all)
+                await conn.run_sync(Base.metadata.create_all)
     except Exception as exc:  # noqa: BLE001 - intentionally broad, see message
         await engine.dispose()
         pytest.fail(DB_BLOCKED_MESSAGE + f"\nOriginal error: {exc!r}\n", pytrace=False)

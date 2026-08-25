@@ -11,10 +11,21 @@ info:
     detection, and `token_version`-based invalidation on password reset — closes
     audit finding #3), plus the OBJ-003 remediation surface (data & transport
     hardening: OTP hashed at rest, TLS to PostgreSQL, constant-time `/login` and
-    `/forgot-password` — closes audit findings #5, #7, #8). Config/startup-only or
-    transport-layer requirements that have no HTTP surface (SECRET_KEY validation,
-    PostgreSQL TLS enforcement) are intentionally NOT modeled here — see
-    `docs/api/obj-001-design-notes.md` §4 and `docs/api/obj-003-design-notes.md` §2.
+    `/forgot-password` — closes audit findings #5, #7, #8), plus the OBJ-004
+    remediation surface (HTTP security baseline: CORS policy, HSTS/X-Frame-Options/
+    CSP/nosniff security headers, `ENVIRONMENT`-gated `/docs`/`/redoc`/`/openapi.json`,
+    structured auth-event logging, removal of the OTP debug `print`, and
+    `X-Forwarded-For`-aware rate-limiter client-IP resolution — closes audit findings
+    #9, #10, #13), plus the OBJ-005 remediation surface (email verification flow:
+    a real `POST /auth/verify-email` + `POST /auth/resend-verification-email`,
+    `is_verified` enforcement at `/auth/login` and `/auth/refresh`, and a pluggable
+    `EmailSender` abstraction replacing the print-based mock — closes audit finding
+    #11). Config/startup-only or transport-layer requirements that have no
+    HTTP surface (SECRET_KEY validation, PostgreSQL TLS enforcement, CORS/security-
+    headers middleware, environment gating, audit logging, `EmailSender` provider
+    selection) are intentionally NOT modeled here — see `docs/api/obj-001-design-
+    notes.md` §4, `docs/api/obj-003-design-notes.md` §2, `docs/api/obj-004-design-
+    notes.md` (full document), and `docs/api/obj-005-design-notes.md` (full document).
     Session/token persistence design (the `refresh_sessions` table, reuse-detection
     state machine, `token_version` claim) is documented in
     `docs/api/obj-002-design-notes.md`. **Note on finding numbers:** `obj-003-design-
@@ -22,8 +33,11 @@ info:
     `dependency_graph.md`'s OBJ-003 row and `docs/security/audit-report.md`'s actual
     numbering — #5/#7/#8 as used throughout this file follow the audit report's real
     numbering (#5 = timing side-channel, #7 = OTP plaintext, #8 = no TLS), not the
-    dependency graph's (as-yet-uncorrected) citation.
-  version: "0.4.0-obj-003"
+    dependency graph's (as-yet-uncorrected) citation. OBJ-004's #9/#10/#13 citation was
+    independently verified against `audit-report.md` and found correct, no transposition
+    (`obj-004-design-notes.md` §0). OBJ-005's #11 citation was independently verified
+    against `audit-report.md` and found correct (`obj-005-design-notes.md` §0).
+  version: "0.6.0-obj-005"
   contact:
     name: solution-architect (PRJ-003)
 servers:
@@ -48,9 +62,23 @@ paths:
       tags: [auth]
       summary: Create a new user account
       description: >-
-        Unchanged by OBJ-001. Current behavior explicitly enumerates existing emails
-        via 400 — this is a known, separately-tracked decision (OBJ-007), not part of
-        this objective's scope. Documented here for completeness only.
+        Enumeration behavior (explicit `400` on an existing email) unchanged by
+        OBJ-001 — a known, separately-tracked decision (OBJ-007), not part of any
+        other objective's scope.
+
+        **Changed by OBJ-005 (finding #11).** On success, this endpoint now also
+        generates a 6-digit `purpose="email_verification"` `Verification` row
+        (same OTP/HMAC-at-rest mechanism as password-reset OTPs — see
+        `obj-005-design-notes.md` §1) and sends it via the injected `EmailSender`
+        (§4) **before** committing. Response shape and status code (`201`,
+        `UserResponse`, `is_verified: false`) are unchanged — Scenario 1.1's AC
+        forbids leaking the code/token in this response body.
+
+        **New failure mode (Gate 1 decision 3, strict):** if the verification
+        email cannot be sent, the entire registration is rolled back — no `User`
+        row and no `Verification` row survive — and the call fails `503`. See
+        `obj-005-design-notes.md` §2.3 for the transaction-boundary mechanism
+        (`flush()` before the send attempt, `rollback()` on failure).
       requestBody:
         required: true
         content:
@@ -59,7 +87,7 @@ paths:
               $ref: '#/components/schemas/UserCreate'
       responses:
         '201':
-          description: User created
+          description: User created; a verification code has been emailed
           content:
             application/json:
               schema:
@@ -74,6 +102,17 @@ paths:
                 detail: "The user with this email already exists in the system."
         '422':
           $ref: '#/components/responses/ValidationError'
+        '503':
+          description: >-
+            The verification email could not be sent. The registration was
+            rolled back (no user was created) — see `obj-005-design-notes.md`
+            §2.3.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Registration could not be completed: the verification email could not be sent. Please try again."
 
   /auth/login:
     post:
@@ -106,6 +145,21 @@ paths:
         `/auth/refresh` and `/auth/logout` build on. Request/response shape is
         unchanged; only JWT payload contents and this new persistent side effect are
         new.
+
+        **Changed by OBJ-004 (finding #10, informational only):** this endpoint now
+        emits a structured `auth.login.success`/`auth.login.failure` audit-log event
+        server-side (email, IP, outcome — never the password). No request/response
+        contract change; see `obj-004-design-notes.md` §4.
+
+        **Changed by OBJ-005 (finding #11).** An unverified user (`is_verified ==
+        false`) with otherwise-correct credentials is now rejected — Gate 1 decision
+        1 (block, Option A). Positioned after the bcrypt call (finding #5's
+        structural guarantee is preserved) and after the existing `is_active`
+        check, in the same `400` status family and same "business-state error"
+        category as that existing check — a deliberate, precedented choice over a
+        fully generic response; see `obj-005-design-notes.md` §3 for the full
+        reasoning and the one-line alternative if the stricter fully-generic
+        behavior is preferred instead.
       requestBody:
         required: true
         content:
@@ -120,7 +174,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Token'
         '400':
-          description: Invalid credentials or inactive user
+          description: Invalid credentials, inactive user, or unverified email
           content:
             application/json:
               schema:
@@ -130,6 +184,8 @@ paths:
                   value: { detail: "Incorrect email or password" }
                 inactive:
                   value: { detail: "Inactive user" }
+                unverified:
+                  value: { detail: "Email not verified" }
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -165,6 +221,14 @@ paths:
         rather than in plaintext (finding #7) — an internal storage-format change with
         no effect on this endpoint's request/response contract; see
         `obj-003-design-notes.md` §1.
+
+        **Changed by OBJ-004 (finding #10, informational only):** the debug `print`
+        that previously wrote the raw OTP to stdout has been removed. OTP delivery now
+        goes through a temporary placeholder seam (`app/core/notifications.py`) pending
+        OBJ-005's real pluggable email-sender abstraction; a structured
+        `auth.otp.requested` audit-log event is emitted instead (email, IP, purpose —
+        never the OTP value itself). No request/response contract change; see
+        `obj-004-design-notes.md` §5.
       requestBody:
         required: true
         content:
@@ -309,6 +373,99 @@ paths:
         '429':
           $ref: '#/components/responses/RateLimited'
 
+  /auth/verify-email:
+    post:
+      operationId: verifyEmail
+      tags: [auth]
+      summary: Consume an email-verification code to activate the account
+      description: >-
+        **New endpoint, OBJ-005 (finding #11).** Accepts the code the same way
+        `/auth/verify-otp` does — same request schema, same rate-limit shape, same
+        shared-attempts-budget/generic-`400` mechanism — but scoped to
+        `purpose="email_verification"` (a disjoint budget from password-reset's
+        `purpose="reset_password"`; a failed attempt on one never affects the
+        other's counter). See `obj-005-design-notes.md` §1.1 and §2.1.
+
+        Unlike `/auth/verify-otp` (check without consuming), this endpoint
+        **consumes** the code on success: sets `User.is_verified = True` and
+        deletes the `Verification` row — matching `/auth/reset-password`'s
+        "consume and delete" pattern. A replayed code after success therefore
+        falls into the same "no live row" branch as any other invalid code (no
+        special-casing needed for reuse detection).
+
+        Does **not** issue tokens — the response reports the updated user state
+        only. Callers proceed to `/auth/login` normally afterward, which now
+        succeeds since `is_verified` is `true`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTPVerifyRequest'
+      responses:
+        '200':
+          description: Email verified; `User.is_verified` is now `true`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '400':
+          description: >-
+            Invalid, expired, already-used, or attempt-locked-out verification
+            code. All cases indistinguishable by design (same anti-oracle rule as
+            `/auth/verify-otp`/`/auth/reset-password`), distinct message text from
+            those endpoints (no cross-endpoint oracle — the two purposes never
+            share a response).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPError'
+              example:
+                detail: "Invalid or expired verification code"
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/resend-verification-email:
+    post:
+      operationId: resendVerificationEmail
+      tags: [auth]
+      summary: Request a fresh email-verification code
+      description: >-
+        **New endpoint, OBJ-005 (finding #11), Gate 1 decision 5.** Mirrors
+        `/auth/forgot-password`'s pattern almost exactly: IP+email rate limiting,
+        a silent resend cooldown, and an always-generic `200` response regardless
+        of whether the email exists — deliberately unauthenticated (no
+        `Authorization` header) so a user who lost their session before verifying
+        can still request a fresh code. See `obj-005-design-notes.md` §2.2.
+
+        If the account is already verified, this is a silent no-op (same generic
+        `200`, no new code generated, no email sent) — avoids both an
+        already-verified-user oracle and an unwanted "already verified" email on
+        every resend spam attempt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailRequest'
+      responses:
+        '200':
+          description: >-
+            Always returned regardless of whether the email exists or is already
+            verified (anti-enumeration).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                msg: "If the email exists and is not yet verified, a verification code has been sent."
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
   /auth/refresh:
     post:
       operationId: refreshAccessToken
@@ -351,6 +508,22 @@ paths:
         Unlike the pre-OBJ-002 contract, the `refresh_token` in the response is
         **never** the same string that was submitted — callers must persist the
         rotated token and discard the old one immediately.
+
+        **Changed by OBJ-004 (finding #10, informational only):** emits a structured
+        `auth.refresh.success`, `auth.refresh.reuse_detected` (logged at `WARNING` —
+        this is a possible-token-theft signal), or `auth.refresh.failure` audit-log
+        event server-side (user/family/jti identifiers only — never a raw token
+        string). No request/response contract change; see `obj-004-design-notes.md`
+        §4.
+
+        **Changed by OBJ-005 (finding #11).** Step 4 of the state machine above
+        (loaded alongside the existing `is_active`/`token_version` check, same
+        query, no extra DB round trip) now also rejects a session whose owning
+        user has `is_verified == false` — implements Scenario 2.A.4 (a holder of an
+        otherwise-valid refresh token cannot mint a new access token once
+        verification is required and not yet satisfied). Same `400` status family
+        as the existing inactive-user branch, distinct message. See
+        `obj-005-design-notes.md` §3.2.
       requestBody:
         required: true
         content:
@@ -368,13 +541,18 @@ paths:
               schema:
                 $ref: '#/components/schemas/Token'
         '400':
-          description: Token was valid but the associated user is inactive or no longer exists
+          description: >-
+            Token was valid but the associated user is inactive, no longer
+            exists, or (OBJ-005) has not yet verified their email.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPError'
-              example:
-                detail: "User inactive or not found"
+              examples:
+                inactive_or_missing:
+                  value: { detail: "User inactive or not found" }
+                unverified:
+                  value: { detail: "Email not verified" }
         '401':
           description: >-
             Token is malformed, has an invalid signature, is expired, has
@@ -452,6 +630,11 @@ paths:
         attempted — an unverified/attacker-controlled `jti` is never used to look up
         or revoke a row, which would otherwise let a forged token be used to log out
         an arbitrary other session by guessing its id.
+
+        **Changed by OBJ-004 (finding #10, informational only):** emits a structured
+        `auth.logout` audit-log event server-side (`jti` when present, IP — never a
+        raw token string). No request/response contract change; see
+        `obj-004-design-notes.md` §4.
       requestBody:
         required: true
         content:

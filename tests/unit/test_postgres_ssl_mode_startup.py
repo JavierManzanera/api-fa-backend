@@ -68,6 +68,16 @@ BASE_ENV_FIELDS = {
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
     "REFRESH_TOKEN_EXPIRE_DAYS": "7",
+    # OBJ-004 finding #13 (obj-004-design-notes.md section 3): ENVIRONMENT is
+    # a second new required-no-default field, added PROACTIVELY here for the
+    # same reason this file's own docstring already explains for
+    # POSTGRES_SSL_MODE's addition to test_secret_key_startup.py -- without
+    # it, every test below (including the "valid ssl modes permit startup"
+    # ones) would start failing for the unrelated reason of a second missing
+    # required field the moment `developer` adds ENVIRONMENT, masking what's
+    # actually under test in THIS file. See
+    # tests/unit/test_environment_settings.py for the dedicated tests.
+    "ENVIRONMENT": "development",
 }
 
 

@@ -101,6 +101,96 @@ Verified against the same throwaway self-provisioned Postgres pattern as
 every prior pass: full suite (`tests/unit` + `tests/api`, OBJ-000/001/002/003
 combined) -- **57 failed, 61 passed** (118 total).
 
+## OBJ-006 pass (2026-08-23/24, database-architect, Alembic migration authorship)
+
+`alembic/versions/0001_baseline_current_schema.py` through
+`0008_refresh_sess_partial_uniq.py` (8 migrations) now exist, replacing
+`Base.metadata.create_all` as the schema source of truth going forward.
+Full write-up, verification results, and the handoff to `devops-engineer`
+are in `.ai-context/dependency_graph.md`'s "OBJ-006 -- database-architect
+migration authorship" section. Two things that affect how you run this
+suite:
+
+### Running against real Alembic migrations instead of `create_all`
+
+By default (`TEST_DB_SCHEMA_SOURCE` unset, or `create_all`), `db_engine` in
+`tests/conftest.py` behaves exactly as before: `drop_all` then `create_all`
+against `TEST_DATABASE_URL`, no setup beyond an empty/owned Postgres.
+
+To instead run the suite against a schema built by real Alembic migrations
+(the actual proof the migrations are equivalent to `create_all`, not just
+that `alembic upgrade head` runs without erroring):
+
+```
+# 1. Provision the schema via Alembic (NOT create_all) against your test DB.
+#    Use 0007, not head -- see the CRITICAL warning below.
+MIGRATOR_DATABASE_URL=postgresql+psycopg2://test:test@localhost:5433/api_fa_test \
+  alembic upgrade 0007_grant_dml_role_privileges
+
+# 2. Point pytest at the same database and tell db_engine not to
+#    drop_all/create_all over it.
+TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5433/api_fa_test \
+TEST_DB_SCHEMA_SOURCE=alembic \
+  pytest
+```
+
+**CRITICAL -- do not migrate to `head` (i.e. do not include migration
+0008) before running the suite this way, or your own app.** Migration
+0008 (the partial unique index defense on `refresh_sessions`) is
+confirmed, empirically, to break the current `/auth/refresh` rotation
+handler's insert-then-revoke ordering -- see migration 0008's own
+docstring and the OBJ-006 dependency_graph.md section for the full
+reproduction. Stop at `0007_grant_dml_role_privileges` until `developer`
+lands the handler reorder that migration flags as required.
+
+`devops-engineer`: whether CI runs in `create_all` mode, `alembic` mode,
+or both (e.g. a dedicated job that provisions via Alembic specifically to
+catch model/migration drift) is your call -- flagged, not decided, in the
+OBJ-006 dependency_graph.md section.
+
+### KNOWN BLOCKER -- 2026-08-24 (database-architect, OBJ-006 verification pass)
+
+This authoring environment's `greenlet` native extension (`_greenlet.pyd`,
+a hard dependency of SQLAlchemy's `AsyncEngine`/`AsyncSession` -- used for
+*every* async DB operation, not just asyncpg-specific ones) is blocked at
+import time by a Windows Application Control policy:
+`ImportError: DLL load failed while importing _greenlet: An Application
+Control policy has blocked this file.` This is new as of this pass --
+every prior objective's passes ran the full async suite successfully
+against a self-provisioned Postgres, so this is an environment change, not
+a code regression. It blocks `tests/api/**` and any other async-engine
+code path entirely (confirmed via direct `import greenlet`, reproducible,
+not intermittent); `tests/unit/**` that don't touch the DB are unaffected.
+It does NOT block plain synchronous SQLAlchemy (`create_engine` +
+`psycopg2`, no greenlet involved) or Alembic itself (migrations run
+synchronously, confirmed working throughout the OBJ-006 pass).
+
+Because of this, OBJ-006's own migration verification could not run this
+repo's pytest suite end-to-end as originally intended. What was verified
+instead, all against a self-provisioned throwaway Postgres 16 (same
+`initdb`/`pg_ctl`-equivalent pattern as every prior pass -- see the OBJ-006
+dependency_graph.md section for exact commands and results): the full
+upgrade/downgrade/re-upgrade cycle for all 8 migrations; a byte-for-byte
+`psql \d` diff proving migration 0001's baseline is schema-identical to
+`Base.metadata.create_all`'s output (captured via a sync engine, sidestepping
+greenlet); the documented `stamp`-then-`upgrade` cutover path against a
+simulated pre-existing `create_all` database; migration 0006's validation
+failure/success paths; migration 0007's grant/revoke behavior against real
+`fa_app`/`fa_migrator` roles (including confirming `fa_app` genuinely
+cannot ALTER or self-escalate GRANTs); and migration 0008's
+rotation-handler incompatibility, reproduced deterministically via raw SQL
+mirroring `/auth/refresh`'s exact operation order.
+
+**Not yet re-verified because of this blocker: the actual pytest suite
+(118+ tests) against a migrated schema.** Flagging explicitly for whoever
+picks this up next (`qa-engineer` and/or `devops-engineer`) once the
+Application Control policy is resolved or worked around through a
+sanctioned channel (not something to route around from inside an agent
+session) -- re-run both the `create_all`-mode suite (regression check) and
+the `TEST_DB_SCHEMA_SOURCE=alembic` suite (schema-equivalence check, per
+the section above, stopping at migration 0007) and confirm both match the
+previously-recorded pass counts.
+
 ## Layout
 
 - `tests/conftest.py` -- env-var bootstrap (must precede any `app.*`
