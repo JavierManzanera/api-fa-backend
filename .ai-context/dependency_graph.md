@@ -35,6 +35,9 @@ a specific finding number — read the cited finding, don't trust a one-line par
 
 [OBJ-007] Registration Enumeration Policy Decision (LOW) — blocked on a product decision from the
 user, not on any other objective's code.
+
+[OBJ-008] Replace python-jose with PyJWT[cryptography] (LOW, backlog) — removes the ecdsa
+dependency (and its suppressed CVE) from the tree entirely, not urgent.
 ```
 
 ## Active Objectives Status
@@ -49,6 +52,8 @@ user, not on any other objective's code.
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `8ea1294`) | audit-report.md #11 |
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | **CLOSED** (`c4c518b` + PR #1 merge `2bc6eb6`) | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
+| — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | In progress (developer next) | audit-report.md #15 |
+| OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | Not Started (backlog, LOW, no deadline) | audit-report.md #15 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
 
@@ -166,6 +171,24 @@ Status: Not Started, blocked on a product decision (not code) | Traces to: audit
 Decide: keep `/register`'s explicit "email already exists" `400` (documented accepted risk) vs.
 switch to a generic response matching `/forgot-password`'s anti-enumeration pattern. Not yet raised
 with the user.
+
+## Finding #15 remediation — `ALGORITHM` config guardrail
+
+Status: CLOSED (commit `b97f9a5`, live-verified 267/267 green on `tests/unit`+`tests/api` 2026-08-25
+— not yet merged, awaiting PR review) | Agent chain: security-specialist → developer → qa-engineer
+Docs: security=`audit-report.md` §"Auditoría puntual — PYSEC-2026-1325 / python-ecdsa / ALGORITHM
+sin validar (2026-08-25)" (finding #15, MEDIUM)
+Fail-closed `field_validator` on `Settings.ALGORITHM` restricting it to `{"HS256"}`, same pattern as
+`POSTGRES_SSL_MODE`/`ENVIRONMENT`. User approved doing this now (2026-08-25); durable fix (dropping
+`python-jose` entirely) tracked separately as OBJ-008 backlog.
+
+## OBJ-008 — Replace `python-jose` with `PyJWT[cryptography]` (backlog)
+
+Status: Not Started, backlog (LOW, no deadline) | Traces to: audit-report.md #15
+Rationale: removes `ecdsa` (and the suppressed `PYSEC-2026-1325` CVE) from the dependency tree
+entirely instead of reasoning about reachability indefinitely. security-specialist scoped it as
+~2 app files + 8 test files, near-identical API — user approved opening this as a tracked backlog
+item (2026-08-25), not urgent.
 
 ## Commits
 
