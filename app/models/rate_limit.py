@@ -1,7 +1,7 @@
 import uuid
 
 from sqlalchemy import DateTime, Index, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import INET, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
 
@@ -33,6 +33,6 @@ class RateLimitHit(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     scope: Mapped[str] = mapped_column(String, nullable=False)
-    ip: Mapped[str] = mapped_column(String, nullable=False)
+    ip: Mapped[str] = mapped_column(INET, nullable=False)
     email: Mapped[str] = mapped_column(String, nullable=False)
     created_at: Mapped[float] = mapped_column(DateTime(timezone=True), nullable=False)
