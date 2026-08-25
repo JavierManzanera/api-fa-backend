@@ -47,7 +47,7 @@ user, not on any other objective's code.
 | OBJ-003 | OTP HMAC-at-rest; TLS to Postgres; timing side-channel mitigation | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED** (commit `5ce5e2c`) | audit-report.md #5, #7, #8 |
 | OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | **CLOSED** (commit `bcd058f`) | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `8ea1294`) | audit-report.md #11 |
-| OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | Both pieces DONE (commit `c4c518b`); **new finding awaiting decision** (`RateLimitHit.ip` type mismatch) | audit-report.md #12, #14 |
+| OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | **CLOSED** (`c4c518b` + PR #1 merge `2bc6eb6`) | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
@@ -120,38 +120,29 @@ fixed same pass, both independently re-confirmed CLOSED.
 
 ## OBJ-006 — Migrations & Supply Chain Hardening
 
-Status: database-architect piece DONE (2026-08-24); devops-engineer piece DONE (2026-08-25, commit
-`c4c518b`, pushed+verified) | Agent chain: database-architect → devops-engineer
+Status: CLOSED (`c4c518b` direct-to-main under the old policy + PR #1 / merge `2bc6eb6` under the
+new one) | Agent chain: database-architect → devops-engineer → developer (RateLimitHit.ip fix) →
+devops-engineer (CI YAML fix)
 Docs: plan+migrations+handoff=`docs/database/obj-006-migration-plan.md` (includes the Gate 1
 approval, migration-authorship, and devops addendum sections)
-devops-engineer delivered: `.github/workflows/ci.yml` (4 jobs: dependency-audit, test,
-role-separation-smoke-test, test-alembic-schema-drift[advisory]) · pinned
-`requirements(-dev).txt` + generated `requirements(-dev).lock.txt` (finding #12) · `pip-audit`
-wired, one documented `--ignore-vuln` (unfixed upstream `python-ecdsa` PYSEC-2026-1325, pulled in
-by `python-jose`) · `app/core/scheduler.py` (APScheduler cleanup jobs per Gate-1 retention
-windows) · CI role-separation smoke test (finding #14). Every CI migration step targets `0007`
-explicitly, never `head`/`0008` — guardrail confirmed respected.
-**Finding from devops-engineer's pass, user-approved fix, DONE (2026-08-25):**
-`app/models/rate_limit.py`'s `RateLimitHit.ip` was ORM-typed `String` while migration 0006 already
-casts the real DB column to native `INET` — the single root cause of all 60
-`test-alembic-schema-drift` CI failures (`create_all` mode, unaffected, is why this was invisible
-until now). `developer` fixed it: `ip: Mapped[str] = mapped_column(INET, nullable=False)` (kept
-`Mapped[str]` — `app/core/rate_limit.py` only ever handles plain string IPs, `postgresql.INET`
-marshals transparently). Verified green in both modes: `create_all` 255/255, `alembic`
-(stopped at 0007) 255/255. Commit `bae2915` on branch `obj-006-migrations-supply-chain` — **not
-yet merged to `main`, PR pending** (see Commit+push policy change below).
+devops-engineer delivered: `.github/workflows/ci.yml` (4 jobs, all now correctly named — a job
+`name:` containing an unquoted ` #` was silently truncated by YAML comment parsing, caught when it
+broke a required branch-protection status check, fixed in `f930513`) · pinned
+`requirements(-dev).txt` + `requirements(-dev).lock.txt` (finding #12) · `pip-audit` wired ·
+`app/core/scheduler.py` (APScheduler cleanup jobs) · CI role-separation smoke test (finding #14).
+Every CI migration step targets `0007` explicitly, never `head`/`0008`.
+`RateLimitHit.ip` ORM/migration-drift fix (model was `String`, migration 0006 casts DB column to
+`INET`) — closed, both modes 255/255 green, confirmed on real CI too.
+**Commit+push policy change (2026-08-25, mid-objective) — this is the objective where it happened:**
+`c4c518b` (CI pipeline etc.) landed direct-to-`main` under the *old* policy; the
+`RateLimitHit.ip`/YAML fixes that followed went through the *new* one (branch
+`obj-006-migrations-supply-chain` → PR #1 → user-reviewed-and-merged on GitHub, `2bc6eb6`) — see
+`CLAUDE.md` directive #4 for the full policy and reasoning. GitHub branch protection on `main` is
+now live and verified (direct push tested and rejected with `GH006`).
 Secondary, lower-urgency, not yet actioned: `docs/database/sql/provision_db_roles.sql`'s DML
-grants assume the 4 tables already exist, which doesn't hold for a genuine greenfield DB — CI works
+grants assume the 4 tables already exist, doesn't hold for a genuine greenfield DB — CI works
 around it with a narrower bootstrap subset; real operator script may need the same split for an
 actual staging/production cutover.
-**Commit+push policy change (2026-08-25, mid-objective):** this objective's own `devops-engineer`
-commit (`c4c518b`) was the concrete example that prompted a workspace-wide policy change — see
-`CLAUDE.md` directive #4. Going forward, no agent/orchestrator pushes directly to `main`; each
-objective gets its own branch (`obj-<ID>-<slug>`), and `main` only advances via a user-approved PR
-merge. `c4c518b` and everything before it landed on `main` under the old (now superseded) policy
-and is not being retroactively unwound. The `RateLimitHit.ip` fix above is the first commit made
-under the new policy — on branch `obj-006-migrations-supply-chain`, PR to follow once `gh` is
-authenticated.
 Gate 1 decisions (APPROVED 2026-08-23): `rate_limit_hits` retention 1hr · `refresh_sessions`
 retention floor = 7 days (`REFRESH_TOKEN_EXPIRE_DAYS`, hard floor, not adjustable downward) ·
 cleanup scheduler = APScheduler over `pg_cron` · migration 0005 (timestamp convergence) kept ·
@@ -184,7 +175,13 @@ with the user.
 - `bcd058f` (2026-08-25) — OBJ-004 full slice (Gate 3: qa-engineer + security-specialist both PASS).
 - `8ea1294` (2026-08-25) — OBJ-005 full slice (Gate 3, 2 rounds: 2 MEDIUM findings raised + fixed +
   re-verified same pass, both closed).
-- All five pushed to `origin/main` (verified 2026-08-25, see `CLAUDE.md` commit+push discipline).
+- `c4c518b` (2026-08-25) — OBJ-006 devops-engineer slice (CI, lockfiles, pip-audit, cleanup jobs) —
+  last commit pushed direct-to-`main` under the old policy.
+- `2bc6eb6` (2026-08-25) — merge of PR #1 (`RateLimitHit.ip` fix + CI YAML quoting fix) — first
+  objective closed under the new branch+PR-to-main policy (see `CLAUDE.md` directive #4).
+- All pushed/merged to `origin/main` (verified 2026-08-25, see `CLAUDE.md` commit+push discipline).
+  `main` now has GitHub branch protection: PR required, direct push blocked (tested), 3 required
+  CI status checks, `enforce_admins: true`.
 
 ## Notes
 
