@@ -571,6 +571,29 @@ this plan's §5, since both touch the same code). **Until that lands: stop at
 docstring carries this warning. `devops-engineer`: do not wire 0008 into any automated deploy step
 until a `developer` pass clears this.
 
+### FIXED (2026-08-25, developer, OBJ-010, commit `f1758a5`)
+
+`app/api/v1/endpoints/auth.py`'s `/auth/refresh` handler now does revoke→insert→link, exactly the
+validated shape above: (1) an atomic `UPDATE refresh_sessions SET revoked_at = :now WHERE id = :jti
+AND revoked_at IS NULL` on the old row (repeats the `revoked_at IS NULL` predicate — also closes the
+§5 TOCTOU gap: 0 rows affected now fails the refresh closed with a 401 instead of proceeding), then
+(2) `_issue_tokens_and_session` inserts the new row + `flush()`, then (3) a second `UPDATE` sets the
+old row's `replaced_by` to the new row's id. Combined with the TOCTOU fix per this doc's own
+recommendation, same code, same commit.
+
+Verified end-to-end against a disposable local Postgres 16 (`initdb`/`pg_ctl`, port 5434 to avoid a
+concurrent worktree's instance already on 5433) migrated all the way through `alembic upgrade head`
+(0008 included): reproduced the exact `duplicate key value violates unique constraint
+"ux_refresh_sessions_family_id_active"` failure this section describes against the pre-fix handler
+(4/6 `tests/api/test_refresh_rotation.py` tests failed), then confirmed the fix clears it — full
+suite **281 passed** (279 previously-existing + 2 new OBJ-010 tests:
+`test_obj010_multiple_sequential_rotations_do_not_violate_family_unique_constraint` rotates a session
+5x in a row against the 0008-migrated schema; `test_obj010_concurrently_revoked_session_fails_closed_on_refresh`
+simulates the TOCTOU race and asserts a 401 fail-closed). Also re-ran the full suite against the
+normal `create_all` schema CI actually uses today (no `TEST_DB_SCHEMA_SOURCE=alembic`): same **281
+passed**, zero regressions. 0008 is now safe to include when `database-architect`/`devops-engineer`
+next move CI's pinning off `0007`.
+
 ## Environment blocker: `greenlet` blocked by Windows Application Control (2026-08-24)
 
 `import greenlet` fails with `ImportError: DLL load failed... An Application Control policy has
