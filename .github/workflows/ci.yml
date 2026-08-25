@@ -23,7 +23,7 @@ env:
 jobs:
   # --- Supply-chain gate (audit-report.md finding #12) -----------------
   dependency-audit:
-    name: pip-audit (supply chain)
+    name: "pip-audit (supply chain)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
   # Matches the test suite's default/documented mode (tests/README.md) and
   # every prior objective's Gate 3 pass. This is the REQUIRED gate.
   test:
-    name: pytest (create_all schema)
+    name: "pytest (create_all schema)"
     needs: dependency-audit
     runs-on: ubuntu-latest
     steps:
@@ -103,7 +103,7 @@ jobs:
   # separation there would add friction for no real benefit against an
   # ephemeral single-developer database).
   role-separation-smoke-test:
-    name: DDL/DML role separation (finding #14)
+    name: "DDL/DML role separation (finding #14)"
     needs: dependency-audit
     runs-on: ubuntu-latest
     steps:
@@ -174,7 +174,7 @@ jobs:
   # this target until a developer pass reorders that handler and the
   # migration-plan doc is updated to say 0008 is safe.
   test-alembic-schema-drift:
-    name: pytest (alembic-provisioned schema, stops at 0007 -- advisory)
+    name: "pytest (alembic-provisioned schema, stops at 0007 -- advisory)"
     needs: dependency-audit
     runs-on: ubuntu-latest
     continue-on-error: true

@@ -131,17 +131,27 @@ wired, one documented `--ignore-vuln` (unfixed upstream `python-ecdsa` PYSEC-202
 by `python-jose`) · `app/core/scheduler.py` (APScheduler cleanup jobs per Gate-1 retention
 windows) · CI role-separation smoke test (finding #14). Every CI migration step targets `0007`
 explicitly, never `head`/`0008` — guardrail confirmed respected.
-**New finding from this pass, needs a decision:** `app/models/rate_limit.py`'s `RateLimitHit.ip`
-column is still ORM-typed `String`, but migration 0006 changed the actual DB column to native
-`INET` — confirmed as the single root cause of all 60 `test-alembic-schema-drift` CI failures
-(create_all mode, which most local dev used until now, is unaffected and fully green, which is why
-this was never caught before). **In a real Alembic-migrated deployment, every rate-limit-gated
-request would fail.** `devops-engineer` kept the CI job advisory/non-blocking rather than fixing it
-(out of their scope) or hiding it. Needs `developer`/`database-architect` to fix the model to match
-migration 0006. Secondary, lower-urgency note: `docs/database/sql/provision_db_roles.sql`'s DML
+**Finding from devops-engineer's pass, user-approved fix, DONE (2026-08-25):**
+`app/models/rate_limit.py`'s `RateLimitHit.ip` was ORM-typed `String` while migration 0006 already
+casts the real DB column to native `INET` — the single root cause of all 60
+`test-alembic-schema-drift` CI failures (`create_all` mode, unaffected, is why this was invisible
+until now). `developer` fixed it: `ip: Mapped[str] = mapped_column(INET, nullable=False)` (kept
+`Mapped[str]` — `app/core/rate_limit.py` only ever handles plain string IPs, `postgresql.INET`
+marshals transparently). Verified green in both modes: `create_all` 255/255, `alembic`
+(stopped at 0007) 255/255. Commit `bae2915` on branch `obj-006-migrations-supply-chain` — **not
+yet merged to `main`, PR pending** (see Commit+push policy change below).
+Secondary, lower-urgency, not yet actioned: `docs/database/sql/provision_db_roles.sql`'s DML
 grants assume the 4 tables already exist, which doesn't hold for a genuine greenfield DB — CI works
 around it with a narrower bootstrap subset; real operator script may need the same split for an
 actual staging/production cutover.
+**Commit+push policy change (2026-08-25, mid-objective):** this objective's own `devops-engineer`
+commit (`c4c518b`) was the concrete example that prompted a workspace-wide policy change — see
+`CLAUDE.md` directive #4. Going forward, no agent/orchestrator pushes directly to `main`; each
+objective gets its own branch (`obj-<ID>-<slug>`), and `main` only advances via a user-approved PR
+merge. `c4c518b` and everything before it landed on `main` under the old (now superseded) policy
+and is not being retroactively unwound. The `RateLimitHit.ip` fix above is the first commit made
+under the new policy — on branch `obj-006-migrations-supply-chain`, PR to follow once `gh` is
+authenticated.
 Gate 1 decisions (APPROVED 2026-08-23): `rate_limit_hits` retention 1hr · `refresh_sessions`
 retention floor = 7 days (`REFRESH_TOKEN_EXPIRE_DAYS`, hard floor, not adjustable downward) ·
 cleanup scheduler = APScheduler over `pg_cron` · migration 0005 (timestamp convergence) kept ·
