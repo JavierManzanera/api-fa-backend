@@ -155,9 +155,8 @@ that `alembic upgrade head` runs without erroring):
 
 ```
 # 1. Provision the schema via Alembic (NOT create_all) against your test DB.
-#    Use 0007, not head -- see the CRITICAL warning below.
 MIGRATOR_DATABASE_URL=postgresql+psycopg2://test:test@localhost:5433/api_fa_test \
-  alembic upgrade 0007_grant_dml_role_privileges
+  alembic upgrade head
 
 # 2. Point pytest at the same database and tell db_engine not to
 #    drop_all/create_all over it.
@@ -166,14 +165,17 @@ TEST_DB_SCHEMA_SOURCE=alembic \
   pytest
 ```
 
-**CRITICAL -- do not migrate to `head` (i.e. do not include migration
-0008) before running the suite this way, or your own app.** Migration
-0008 (the partial unique index defense on `refresh_sessions`) is
-confirmed, empirically, to break the current `/auth/refresh` rotation
-handler's insert-then-revoke ordering -- see migration 0008's own
-docstring and the OBJ-006 dependency_graph.md section for the full
-reproduction. Stop at `0007_grant_dml_role_privileges` until `developer`
-lands the handler reorder that migration flags as required.
+**RESOLVED (2026-08-25, OBJ-010) -- migrating to `head` (including
+migration 0008) is now safe.** Migration 0008 (the partial unique index
+defense on `refresh_sessions`) used to break the `/auth/refresh` rotation
+handler's insert-then-revoke ordering; `developer` reordered the handler
+to revoke-then-insert in commit `f1758a5`, and `database-architect`
+re-verified `alembic upgrade head` + the full suite (`TEST_DB_SCHEMA_SOURCE=
+alembic pytest`, 281 passed) against a fresh head-migrated schema. See
+migration 0008's own docstring and `docs/database/obj-006-migration-plan.md`
+("CRITICAL finding" / "FIXED" / the OBJ-010 CI-unpinning note) for the full
+history. CI's `test-alembic-schema-drift` job now runs `alembic upgrade
+head` accordingly (`.github/workflows/ci.yml`).
 
 `devops-engineer`: whether CI runs in `create_all` mode, `alembic` mode,
 or both (e.g. a dedicated job that provisions via Alembic specifically to

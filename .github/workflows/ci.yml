@@ -140,7 +140,7 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
-  # --- Required gate: schema via real Alembic migrations (0001..0007) ---
+  # --- Required gate: schema via real Alembic migrations (head, 0001..0008) ---
   # Proves the migrations in alembic/versions/ produce a schema the
   # existing test suite actually accepts, not just that `alembic upgrade`
   # runs without erroring -- the only real regression check against
@@ -160,14 +160,20 @@ jobs:
   # pytest` -- 255 passed, 0 failed. `continue-on-error` removed; this is
   # now a required, blocking gate like the others.
   #
-  # CRITICAL: stops at 0007_grant_dml_role_privileges, NEVER `head` / 0008.
-  # Migration 0008 (refresh_sess_partial_uniq) is confirmed to
-  # deterministically break the current /auth/refresh rotation handler
-  # (see obj-006-migration-plan.md "CRITICAL finding") -- do not change
-  # this target until a developer pass reorders that handler and the
-  # migration-plan doc is updated to say 0008 is safe.
+  # UNPINNED FROM 0007 TO head (database-architect, OBJ-010, 2026-08-25):
+  # was pinned at 0007_grant_dml_role_privileges because migration 0008
+  # (refresh_sess_partial_uniq) deterministically broke the then-current
+  # /auth/refresh rotation handler's insert-then-revoke ordering (see
+  # obj-006-migration-plan.md "CRITICAL finding"). `developer` fixed the
+  # handler to revoke->insert->link in commit f1758a5 (OBJ-010); see that
+  # doc's "FIXED" note for the reproduction/fix detail. Re-verified here
+  # independently against a fresh throwaway initdb/pg_ctl Postgres 16 (port
+  # 5436): `alembic upgrade head` (all 8 migrations) applies cleanly, and
+  # the full suite (`TEST_DB_SCHEMA_SOURCE=alembic pytest`) against that
+  # head-migrated schema -- 281 passed, 0 failed. No more reason to hold
+  # this job back from head; it now tracks head like every other gate.
   test-alembic-schema-drift:
-    name: "pytest (alembic-provisioned schema, stops at 0007)"
+    name: "pytest (alembic-provisioned schema, head)"
     needs: dependency-audit
     runs-on: ubuntu-latest
     steps:
@@ -185,8 +191,8 @@ jobs:
       - name: Start disposable test Postgres
         run: docker compose -f docker-compose.test.yml up -d --wait
 
-      - name: Provision schema via Alembic (stop at 0007, never head)
-        run: alembic upgrade 0007_grant_dml_role_privileges
+      - name: Provision schema via Alembic (head, includes 0008)
+        run: alembic upgrade head
 
       - name: Run full test suite against the migrated schema
         env:
