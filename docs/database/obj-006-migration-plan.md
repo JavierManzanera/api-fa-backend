@@ -30,6 +30,9 @@ open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migrat
 (2026-08-25)", "database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)",
 "CI unpinned from 0007 to head" (OBJ-010, this pass — CI now runs migration 0008/head,
 independently re-verified: clean `alembic upgrade head` + 281 passed).
+"OBJ-014 — rate_limit_hits index follow-up" (2026-08-26, database-architect — migration 0009 adds
+`ix_rate_limit_hits_scope_email_created_at_ip`, EXPLAIN ANALYZE-verified; existing index left
+untouched, deviated from the OBJ-014 design doc's suggested column order — see that section for why).
 
 **Backlog items covered, traced to their source** (all read directly from
 `.ai-context/dependency_graph.md`'s OBJ-006 row and the OBJ-001/002/003 database-architect review
@@ -757,3 +760,65 @@ No env vars beyond what CI already set were needed — `test-alembic-schema-drif
 `docker-compose.test.yml`'s port 5433), and `alembic/env.py`'s own placeholder-`Settings` block
 (§ "env.py design note" above, plus the `ENVIRONMENT` fix already recorded in this doc) already
 covers everything `Base`/model imports need without a real `.env`. Nothing new required.
+
+## OBJ-014 — rate_limit_hits index follow-up (2026-08-26, database-architect)
+
+**Summary:** Added migration `0009_rl_email_created_at_idx` — one new index,
+`ix_rate_limit_hits_scope_email_created_at_ip (scope, email, created_at, ip)` — to serve the
+email-only `COUNT` hot path in `enforce_rate_limit` (runs on every request to every one of the 6
+rate-limited endpoints), which the existing `ix_rate_limit_hits_scope_ip_email_created_at (scope,
+ip, email, created_at)` index does not serve well (cost ~1981, 365 buffer hits in the seeded test,
+vs. cost 4.45–8.45 / 3–5 buffer hits with the new index). **Deviated from
+`obj-014-design-notes.md` §4's suggested `(scope, email, ip, created_at)` column order** — empirically
+verified that ordering repeats the same structural flaw for this exact query (cost 237.50 / 147
+buffers on a heavy-history test, vs. 12.90 / 138 buffers for `(scope, email, created_at, ip)`), because
+`ip` still sits before `created_at`, breaking the range scan. The existing index is **left
+unchanged** — it already serves both the (unchanged) IP-only `COUNT` and the new OBJ-014 per-IP
+`EXISTS` check optimally as-is (verified: Postgres already picks it for the `EXISTS` query at cost
+4.45, because `scope`/`ip`/`email` are all pure-equality predicates there — order among equality
+columns doesn't matter to the planner). So this is two indexes serving two structurally different
+query shapes, not one widened index — see the migration's own docstring for the full reasoning and
+the specific EXPLAIN ANALYZE numbers this section summarizes.
+
+**Context:** `docs/api/obj-013-design-notes.md` §4 first flagged the (never-applied)
+`(scope, email, created_at)` recommendation to serve the email-only `COUNT`; `docs/api/
+obj-014-design-notes.md` §4 layered the new `EXISTS` check on top and suggested widening that
+still-unapplied recommendation to `(scope, email, ip, created_at)`. Both were design-only
+recommendations, not migrations — this pass is the first time either lands as an actual index.
+
+**Migration:** `alembic/versions/0009_rl_email_created_at_idx.py`
+(`revision = "0009_rl_email_created_at_idx"`, `down_revision =
+"0008_refresh_sess_partial_uniq"`). Pure `create_index`/`drop_index`, symmetric, no data risk.
+`app/models/rate_limit.py`'s `__table_args__` updated to declare the new `Index(...)` alongside the
+existing one, with an inline comment on each explaining which query shape it serves (model file is
+documentation here, not the schema source of truth — Alembic migrations are, per this doc's
+existing convention — but kept in sync since the effort is trivial).
+
+**Verification performed** (disposable Postgres 16, own `initdb`/`pg_ctl` data dir, port 5544,
+`trust` auth, torn down after; own per-worktree `.venv` built from `requirements.lock.txt` +
+`requirements-dev.lock.txt`):
+
+1. `MIGRATOR_DATABASE_URL=... alembic upgrade head` from a clean cluster — all 9 migrations
+   (0001–0009) applied cleanly in sequence.
+2. Seeded ~220k rows: ~200k background rows spread across 6 scopes/random emails/IPs over a 2-hour
+   window, plus a finding-#20-shaped attack (one victim email, one fixed attacker IP, 9 hits inside
+   a 55s window) and a separate heavy-history email (~20k rows across 200 distinct IPs over 2 hours,
+   mostly outside any 60s window) to stress-test the two candidate column orders realistically.
+3. `EXPLAIN (ANALYZE, BUFFERS, COSTS)` on all three query shapes `enforce_rate_limit` actually runs
+   (IP-only `COUNT`, email-only `COUNT`, the new per-IP `EXISTS`), before and after the migration,
+   and head-to-head between the two candidate index column orders on the heavy-history case
+   specifically (where the two orders' costs diverge most). Numbers are in the migration's own
+   docstring; headline: email-only `COUNT` went from cost ~1981 (365 buffers) to cost 4.45–8.45
+   (3–5 buffers) after the migration; the `EXISTS` check was already cheap (cost 4.45, 3–4 buffers)
+   both before and after, using the pre-existing index either way.
+4. `alembic downgrade -1` then `alembic upgrade head` again — confirmed clean symmetric
+   round-trip, new index dropped and recreated correctly.
+5. Postgres instance stopped (`pg_ctl stop -m fast`) after verification; no lasting environment
+   state left behind.
+
+**Not this pass's job / explicitly out of scope:** `app/core/rate_limit.py`'s actual banding logic
+(§3 of the OBJ-014 design doc) and the `RATE_LIMIT_EMAIL_RESERVED_SLOTS` config validator (§7) are
+`developer`'s implementation, on a separate branch — not touched here. The `distinct_ip_count_for_email`
+observability query (§2.7) is also `developer`'s call whether/how to implement; the new index's
+trailing `ip` column is deliberately kept (costs nothing for the email-only `COUNT`) so that query
+can use this same index as an index-only-scan source if `developer` adds it.
