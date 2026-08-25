@@ -10,6 +10,14 @@
 - `reset_password` only updates `hashed_password`; no `token_version` or `security_stamp` exists to invalidate previously-issued tokens.
 - A stolen refresh token remains valid for its full 7-day lifetime even after the user changes their password out of security concern.
 
+**Quick index:** 3 stories (Logout, Rotation+reuse-detection, Password-reset invalidation), 14
+Gherkin scenarios + an Edge Cases section. All product decisions this doc leaves open (revocation
+store, logout scope, reuse response, multi-device rotation, legacy-token handling, `token_version`
+vs. `iat` strategy) were resolved by `docs/api/obj-002-design-notes.md` — read that for the actual
+answers, this doc only states the questions/options as originally posed. Jump to: "Story 1:
+Logout", "Story 2: Refresh token rotation", "Story 3: Password reset invalidation", "Edge Cases &
+Security Considerations", "Summary of Decisions Deferred to Phase 1".
+
 ---
 
 ## Story 1: Logout endpoint invalidates the current session

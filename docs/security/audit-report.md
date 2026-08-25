@@ -5,6 +5,38 @@
 
 ---
 
+## Índice de hallazgos (mantener actualizado cada vez que se añade una sección "Gate 3 — Verificación OBJ-00X")
+
+| # | Severidad | Título | Estado | Cerrado en |
+|---|---|---|---|---|
+| 1 | CRÍTICO | Refresh token utilizable como access token | **CERRADO** | OBJ-001 |
+| 2 | CRÍTICO | OTP fuerza-bruteable sin rate limiting | **CERRADO** (residual de budget aceptado en Gate 1) | OBJ-001 |
+| 3 | ALTO | Sin revocación de tokens | **CERRADO** | OBJ-002 |
+| 4 | ALTO | `SECRET_KEY` sin validar | **CERRADO** | OBJ-001 |
+| 5 | MEDIO | Timing side-channel en `/login`/`/forgot-password` | **CERRADO** (residual de forma de queries, trade-off Gate 1) | OBJ-003 |
+| 6 | MEDIO | Enumeración explícita en `/register` | **ABIERTO** — bloqueado en decisión de producto | OBJ-007 (no iniciado) |
+| 7 | MEDIO | OTP en texto plano en BD | **CERRADO** | OBJ-003 |
+| 8 | MEDIO | Sin TLS forzado a PostgreSQL | **CERRADO** (impl.); doc gap nuevo abajo | OBJ-003 |
+| 9 | MEDIO | Sin CORS ni cabeceras de seguridad | Pendiente | OBJ-004 (en curso) |
+| 10 | MEDIO | Sin logging/auditoría de auth | Pendiente | OBJ-004 (en curso) |
+| 11 | BAJO | `is_verified` sin función | Pendiente | OBJ-005 (en curso) |
+| 12 | BAJO | Dependencias sin pin / cadena de suministro | Pendiente | OBJ-006 (en curso) |
+| 13 | BAJO | `/docs`/`/redoc`/`/openapi.json` sin gate de entorno | Pendiente | OBJ-004 (en curso) |
+| 14 | BAJO | Sin separación de privilegios DB (DDL/DML) | Pendiente | OBJ-006 (en curso) |
+
+**Hallazgos nuevos, descubiertos durante pases Gate 3 (no numerados en el informe original):**
+
+| Hallazgo | Severidad | Descubierto en | Estado / destino |
+|---|---|---|---|
+| Rate limiter: `client_ip()` no soporta proxy/LB (`X-Forwarded-For`) | MEDIO | Gate 3 OBJ-001 | Pendiente → OBJ-004 |
+| `rate_limit_hits` sin TTL/purga | BAJO | Gate 3 OBJ-001 | Pendiente → OBJ-006 |
+| `/auth/logout` timing side-channel | BAJO | Gate 3 OBJ-002 | **CERRADO** (fold-in en OBJ-003) |
+| `.env.example` no advierte que `require` es vulnerable a MITM | BAJO | Gate 3 OBJ-003 | Pendiente → OBJ-004 |
+
+**Saltar a:** "Veredicto — OWASP API Security Top 10" (veredicto original) · "Gate 3 — Verificación OBJ-001" · "Gate 3 — Verificación OBJ-002" · "Gate 3 — Verificación OBJ-003" (cada sección Gate 3 tiene su propia tabla de veredicto al final — no hace falta leer la sección completa si solo necesitas el resultado).
+
+---
+
 ## Hallazgos
 
 ### 1. CRÍTICO — Refresh token utilizable como access token (bypass de autenticación)

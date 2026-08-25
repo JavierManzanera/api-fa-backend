@@ -12,6 +12,20 @@ scheduled-cleanup jobs' SQL (backlog items from OBJ-001/OBJ-002 Gate 3). `pip-au
 wiring and the `requirements.txt` lockfile are explicitly **not** this pass's job — see the
 handoff section.
 
+**Quick index:** current schema frozen into migration 0001 (§1) · 8-migration Alembic sequence,
+0001-0007 planned + 0008 added during authorship (§2) · DDL/DML role separation, `fa_migrator`
+vs. `fa_app`, conditional grants that no-op if roles don't exist (§3) · two scheduled cleanup jobs,
+`rate_limit_hits` (1hr) and `refresh_sessions` (7-day floor) (§4) · row-locking/TOCTOU hardening
+explicitly deferred, not a migration (§5) · 7 Gate-1 tradeoffs, all APPROVED 2026-08-23 (§7, see
+"Gate 1 — APPROVED" below) · devops-engineer handoff list (§8, superseded/extended by the second
+"Handoff" section near the bottom, post-migration-authorship). **Read this if you only have time
+for one thing:** "CRITICAL finding: migration 0008 breaks the current `/auth/refresh` handler" —
+migration 0008 is written but NOT SAFE TO DEPLOY past 0007 until `developer` reorders that
+handler. Jump to: "1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role
+separation", "4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item",
+"7. Gate-1 open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration
+authorship", "CRITICAL finding", "Environment blocker: greenlet".
+
 **Backlog items covered, traced to their source** (all read directly from
 `.ai-context/dependency_graph.md`'s OBJ-006 row and the OBJ-001/002/003 database-architect review
 sections cited there, not re-derived):

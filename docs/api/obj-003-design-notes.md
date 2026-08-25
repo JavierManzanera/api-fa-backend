@@ -17,6 +17,18 @@ No `openapi.yaml` schema/response-shape changes are needed for any of the three 
 all three are either non-HTTP-surface (data-at-rest format, DB transport) or latency-only (no
 status code, header, or body change). `openapi.yaml` gets description-text updates only; see §4.
 
+**Quick index:** flags and corrects a #5/#7 finding-number transposition inherited from
+`dependency_graph.md`/the task brief — this doc uses audit-report.md's real numbers (§0) · OTP
+hashed at rest via HMAC-SHA256 with a key derived from `SECRET_KEY`, not reused raw (§1) ·
+`POSTGRES_SSL_MODE` (disable/require/verify-full) with explicit per-mode `asyncpg` SSL context
+building — `require` deliberately does NOT collapse into `verify-full`'s guarantee (§2) ·
+constant-time `/login`+`/forgot-password` via an always-executed dummy-bcrypt call, plus a fold-in
+fix for `/auth/logout`'s timing gap found in OBJ-002's Gate 3 (§3) · no `openapi.yaml` contract
+changes anywhere, description-only (§4) · 2 genuine Gate-1 tradeoffs (TLS enforcement level,
+forgot-password's dummy-work mechanism) + 3 non-blocking flags (§5). Jump to: "0. Finding-number
+mismatch", "1. OTP hashing at rest", "2. TLS to PostgreSQL", "3. Timing side-channel", "4.
+openapi.yaml impact", "5. Open decisions".
+
 ---
 
 ## 0. Finding-number mismatch — read this before citing a number elsewhere

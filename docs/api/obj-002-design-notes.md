@@ -13,6 +13,18 @@ pre-OBJ-002 tokens are affected. Module ownership follows OBJ-001's established 
 security.py` remains the single place that encodes/decodes JWT claims; nothing else decodes a
 token inline.
 
+**Quick index:** new `refresh_sessions` table, no raw JWT stored, just `jti`/`family_id`/
+`revoked_at` (§1) · `/auth/refresh` rotates on every call, reuse of an already-rotated token
+revokes the WHOLE family (industry-standard reuse-detection pattern) (§2) · `token_version`/`ver`
+claim invalidates on password reset, piggybacks on a query `get_current_user` already makes — zero
+extra queries (§3) · `/auth/logout` revokes only the single submitted session, not the family,
+always `204` (§4) · pre-OBJ-002 tokens fail closed automatically via missing-claim = reject, no
+special-casing needed (§5) · 5 non-blocking open decisions, mostly naming/retention (§6) · Phase 3
+addendum: FK-ordering fix for the rotation flush, one test rewritten to source its token via real
+`/auth/login`. Jump to: "0. Threat recap", "1. Persistence", "2. Rotation + reuse detection",
+"3. token_version / ver claim", "4. /auth/logout", "5. Pre-OBJ-002 tokens", "6. Open decisions",
+"Phase 3 implementation addendum".
+
 ---
 
 ## 0. Threat recap (finding #3)

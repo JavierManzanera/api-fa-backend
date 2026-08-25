@@ -4,6 +4,14 @@
 
 **Traces to:** `docs/security/audit-report.md` § Hallazgos #1, #2, #4.
 
+**Quick index:** 3 stories, 20 Gherkin scenarios total. Story 1 (7 scenarios) = refresh tokens
+must not work as access tokens. Story 2 (8 scenarios) = OTP rate limiting + attempt lockout.
+Story 3 (8 scenarios, some overlapping numbering with Story 2's TTL scenario) = `SECRET_KEY`
+startup validation. 6 open Product Decisions at the bottom (OTP attempt limit, lockout duration
+shape, rate-limit threshold, OTP length/TTL, placeholder list, token claim representation) — all
+resolved by `docs/api/obj-001-design-notes.md` §5 and Gate 1, not re-litigated here. Jump to:
+"Story 1", "Story 2", "Story 3", "Product Decisions Required", "Implementation Notes".
+
 ---
 
 ## Story 1: Refresh tokens cannot be used as access tokens

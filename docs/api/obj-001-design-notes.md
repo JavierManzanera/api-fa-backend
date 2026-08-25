@@ -10,6 +10,16 @@ JWT claim schema, the split between rate limiting and OTP lockout, module owners
 and the SECRET_KEY startup contract (finding #4, which is config/process-level, not an HTTP
 route — intentionally excluded from `openapi.yaml`).
 
+**Quick index:** explicit `type` claim on both token types, fail-closed, no legacy-format
+grandfathering (§1) · rate limiting and OTP lockout kept as two separate mechanisms on purpose,
+not merged (§2) · `SECRET_KEY` startup contract, no HTTP surface (§3) · new `GET /auth/me`
+endpoint proposed to give finding #1 a real HTTP path to test against (§4) · thresholds
+(`MAX_OTP_ATTEMPTS=5`, rate limits, cooldown) left as non-blocking open decisions (§5) · Phase 3
+addendum: OTP lockout invalidates via `expires_at=now()` not delete, rate limiter uses a
+row-per-request + `COUNT()` pattern (bottom). Jump to: "1. JWT claim schema", "2. Rate limiting
+vs. OTP lockout", "3. Startup config contract", "4. New endpoint", "5. Open decisions", "Phase 3
+implementation addendum".
+
 ---
 
 ## 1. JWT claim schema (finding #1)
