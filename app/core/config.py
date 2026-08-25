@@ -153,10 +153,14 @@ class Settings(BaseSettings):
     # puntual -- PYSEC-2026-1325 / python-ecdsa / ALGORITHM sin validar"):
     # fail closed, same pattern as POSTGRES_SSL_MODE/ENVIRONMENT above.
     # Runtime exposure to PYSEC-2026-1325 (unfixed side-channel advisory in
-    # the pure-Python `ecdsa` package, pulled in transitively by
-    # `python-jose`) is confirmed zero today -- this app only ever uses
-    # HS256 -- but that was previously an observed fact, not an enforced
-    # invariant. This validator makes it one.
+    # the pure-Python `ecdsa` package, previously pulled in transitively by
+    # `python-jose`) was confirmed zero even before OBJ-008 below -- this app
+    # only ever used HS256 in practice -- but that was previously an
+    # observed fact, not an enforced invariant. This validator makes it one.
+    # OBJ-008 subsequently replaced `python-jose` with `PyJWT[crypto]`
+    # (which never depends on `ecdsa` at all), removing the advisory from
+    # the dependency tree entirely -- this validator is kept as defense in
+    # depth, not because the dependency risk still exists.
     @field_validator("ALGORITHM")
     @classmethod
     def validate_algorithm(cls, value: str) -> str:
@@ -165,10 +169,8 @@ class Settings(BaseSettings):
                 f"ALGORITHM must be one of {sorted(_VALID_ALGORITHMS)}, got "
                 f"{value!r}. ES*/RS*/EdDSA algorithms are not currently "
                 "supported by this template's validated configuration surface "
-                "-- see audit-report.md finding #15 before enabling one "
-                "(python-jose's EC path can fall back to the unpatched "
-                "python-ecdsa side-channel advisory PYSEC-2026-1325 if the "
-                "cryptography package is ever unavailable)."
+                "-- see audit-report.md finding #15 / OBJ-008 before enabling "
+                "one."
             )
         return value
 

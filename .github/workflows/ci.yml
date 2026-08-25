@@ -38,23 +38,18 @@ jobs:
         run: pip install -r requirements-dev.lock.txt
 
       - name: pip-audit against both locked dependency trees
-        # --ignore-vuln PYSEC-2026-1325: python-ecdsa's known, upstream-
-        # unfixed side-channel/non-constant-time-arithmetic advisory
-        # (python-ecdsa's own maintainers do not treat this as fixable in a
-        # pure-Python implementation -- no patched release exists). Pulled
-        # in transitively by python-jose (Requires: ecdsa, pyasn1, rsa --
-        # unconditional, NOT removed by the [cryptography] extra this repo
-        # already pins; confirmed via `pip show python-jose`). Verified
-        # locally 2026-08-25 against requirements.lock.txt /
-        # requirements-dev.lock.txt: this is the ONLY finding in either
-        # lock file today. A specific --ignore-vuln (not a blanket
-        # --skip-audit or severity threshold) so any NEW vulnerability in
-        # any package still fails this job loudly. Revisit if python-jose
-        # ever drops the unconditional ecdsa dependency, or a real fix
-        # lands upstream.
+        # OBJ-008 (audit-report.md finding #15): the `--ignore-vuln
+        # PYSEC-2026-1325` suppression this step used to carry is gone --
+        # that advisory lived in `ecdsa`, pulled in transitively and
+        # unconditionally by `python-jose` (Requires: ecdsa, pyasn1, rsa).
+        # `python-jose` has been replaced by `PyJWT[crypto]`, which never
+        # depends on `ecdsa` at all, so the advisory is no longer reachable
+        # from either lock file -- nothing left to ignore. No severity
+        # threshold or blanket --skip-audit either: any vulnerability in any
+        # package still fails this job loudly.
         run: |
-          pip-audit -r requirements.lock.txt --ignore-vuln PYSEC-2026-1325
-          pip-audit -r requirements-dev.lock.txt --ignore-vuln PYSEC-2026-1325
+          pip-audit -r requirements.lock.txt
+          pip-audit -r requirements-dev.lock.txt
 
   # --- Primary regression gate: schema via Base.metadata.create_all -----
   # Matches the test suite's default/documented mode (tests/README.md) and

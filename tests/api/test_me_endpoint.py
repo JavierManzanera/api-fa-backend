@@ -16,7 +16,7 @@ during this red-phase pass.
 from datetime import timedelta
 
 from freezegun import freeze_time
-from jose import jwt
+import jwt
 
 from app.core import security
 from app.core.config import settings

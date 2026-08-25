@@ -21,7 +21,7 @@ Requires Postgres -- see tests/README.md / tests/conftest.py module
 docstring.
 """
 
-from jose import jwt
+import jwt
 
 from app.core.config import settings
 

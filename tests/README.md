@@ -60,20 +60,17 @@ This project runs concurrent subagents on separate branches via `git
 worktree` (Claude Code's Agent tool `isolation: "worktree"` option). Until
 now everything (main checkout + every worktree) installed straight into
 the one global Python 3.11 interpreter's site-packages -- there was no
-per-project venv at all. That broke this branch
-(`obj-009-register-rate-limit`, cut before `obj-008-pyjwt-migration`
-merged, so its code still imports `python-jose`): a concurrent OBJ-008
-install had uninstalled `python-jose` globally in favor of `PyJWT`, so
-every test here errored with `ModuleNotFoundError: No module named
+per-project venv at all. That broke `obj-009-register-rate-limit` (cut
+before `obj-008-pyjwt-migration` merged, so its code still imports
+`python-jose`): a concurrent OBJ-008 install had uninstalled
+`python-jose` globally in favor of `PyJWT`, so every test on the
+`obj-009` branch errored with `ModuleNotFoundError: No module named
 'jose'` -- an environment artifact, not a real test failure.
 
 **Going forward: each checkout (main working dir, and each
 `.claude/worktrees/<agent-id>` worktree) gets its own `.venv`, built from
 that checkout's own `requirements.lock.txt` / `requirements-dev.lock.txt`**,
-not a shared/global interpreter. This worktree's own `.venv` was created
-this way (`python-jose` confirmed present, `PyJWT` absent, matching this
-branch's lockfiles) and a `pytest --collect-only` pass confirmed clean
-(280 tests collected, no `ModuleNotFoundError`):
+not a shared/global interpreter:
 
 ```
 python -m venv .venv
