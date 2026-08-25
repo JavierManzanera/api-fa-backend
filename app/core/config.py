@@ -56,16 +56,21 @@ class Settings(BaseSettings):
     # Gate 3 section; full investigation:
     # docs/database/obj-012-tls-dast-verification.md, Finding 1): optional
     # path to a CA certificate file to trust for POSTGRES_SSL_MODE=
-    # verify-full, IN ADDITION TO (not instead of) the OS default trust
-    # store. Optional, defaulting to None -- unlike POSTGRES_SSL_MODE, this
-    # is not a "every environment must say what it wants" field: leaving it
-    # unset preserves today's existing verify-full behavior (OS trust store
-    # only) for every deployment that already works against a
-    # publicly-trusted CA. Set this to pin a private/self-signed CA for a
-    # self-hosted Postgres instance -- without it, verify-full fails closed
-    # against any cert the OS doesn't already trust, which was pushing
-    # self-hosted/private-CA operators toward the weaker, MITM-vulnerable
-    # 'require' mode instead.
+    # verify-full, IN PLACE OF (not in addition to) the OS default trust
+    # store -- `ssl.create_default_context(cafile=...)` uses `cafile` as the
+    # sole trust anchor for that connection once it's set, it does not merge
+    # it with the OS store (audit finding #19, docs/security/audit-report.md:
+    # this replacing behavior is more secure than the "in addition to" wording
+    # previously here implied -- it means pinning a private CA also stops
+    # that connection trusting any *other* CA, public or otherwise). Optional,
+    # defaulting to None -- unlike POSTGRES_SSL_MODE, this is not a "every
+    # environment must say what it wants" field: leaving it unset preserves
+    # today's existing verify-full behavior (OS trust store only) for every
+    # deployment that already works against a publicly-trusted CA. Set this
+    # to pin a private/self-signed CA for a self-hosted Postgres instance --
+    # without it, verify-full fails closed against any cert the OS doesn't
+    # already trust, which was pushing self-hosted/private-CA operators
+    # toward the weaker, MITM-vulnerable 'require' mode instead.
     POSTGRES_SSL_ROOT_CERT: Optional[str] = None
 
     SECRET_KEY: str

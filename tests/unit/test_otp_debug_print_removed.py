@@ -18,28 +18,32 @@ derivation from obj-004-design-notes.md section 5:
     non-secret-leaking audit log line + a minimal delivery seam" ->
     test_forgot_password_module_contains_no_print_call,
     test_forgot_password_module_no_longer_prints_the_email_mock_banner.
-  - "app/core/notifications.py (new)... send_otp_notification(email, otp,
-    *, purpose)... monkeypatchable no-op" (Gate 1 APPROVED, dependency_graph.md
-    OBJ-004 Gate 1, decision 3) -> TestNotificationSeamExists.
-  - "notifications.send_otp_notification(payload.email, otp,
-    purpose=RESET_PASSWORD_PURPOSE)" (design notes section 5.1's
-    illustrative call site) -> test_forgot_password_calls_the_notification_seam,
-    which drives the REAL endpoint with the seam mocked and asserts it was
-    called with the real (not hardcoded) OTP -- the same technique
-    tests/api/test_otp_hashing_integration.py now uses to recover the real
-    OTP post-print-removal, exercised here as a focused, single-purpose
-    test of the seam's call site specifically.
 
-Today (red phase): the print statement still exists (confirmed by this
-project's own design notes, which re-verified it directly rather than
-trusting OBJ-003 to have already removed it), and app/core/notifications.py
-does not exist at all.
+--------------------------------------------------------------------------
+CHORE UPDATE (2026-08-26, developer, audit-report.md "notifications.py/
+EmailSender coexisting" finding, obj-005-design-notes.md section 4.1's
+originally-designed end state): the interim `app/core/notifications.py`
+seam this file originally exercised (`TestNotificationSeamExists` and
+`test_forgot_password_calls_the_notification_seam_with_the_real_otp`) is
+retired -- `/auth/forgot-password` now delivers via the `EmailSender`
+abstraction (`render_password_reset_email` + `email_sender.send(...)`),
+matching every other OTP-delivery call site in the codebase, per the
+design notes' own converge-on-one-mechanism instruction. Those two seam-
+specific pieces are replaced below by
+`test_forgot_password_sends_an_email_with_the_real_otp_via_email_sender`,
+which asserts the same property (the endpoint's call site is really wired,
+not just present-but-unused, and is called with the real, freshly-issued
+OTP) through the `EmailSender` dependency-override pattern already
+established in tests/api/test_resend_verification_email.py, instead of
+patching a now-removed module by name.
 """
 
 import inspect
-from unittest.mock import patch
+import re
 
 import app.api.v1.endpoints.auth as auth_endpoints_module
+from app.api import deps
+from app.main import app
 
 
 def test_forgot_password_module_contains_no_print_call():
@@ -48,8 +52,7 @@ def test_forgot_password_module_contains_no_print_call():
         "app/api/v1/endpoints/auth.py must not contain any print(...) call "
         "-- audit finding #10 flags the OTP debug print by name; design "
         "notes section 5 replaces it with a structured audit-log event "
-        "plus the notifications.send_otp_notification seam, never stdout "
-        "print()"
+        "plus real email delivery via EmailSender, never stdout print()"
     )
 
 
@@ -65,80 +68,49 @@ def test_forgot_password_module_no_longer_prints_the_email_mock_banner():
     )
 
 
-class TestNotificationSeamExists:
-    def test_notifications_module_exists_with_send_otp_notification(self):
-        from app.core import notifications
-
-        assert hasattr(notifications, "send_otp_notification"), (
-            "app/core/notifications.py must define send_otp_notification "
-            "(design notes section 5.1, Gate 1 APPROVED decision 3) -- the "
-            "monkeypatchable interim OTP delivery seam"
-        )
-        assert callable(notifications.send_otp_notification)
-
-    def test_send_otp_notification_accepts_email_otp_and_purpose_kwarg(self):
-        """Matches design notes section 5.1's illustrative signature:
-        send_otp_notification(email: str, otp: str, *, purpose: str).
-        Calling it directly must not raise -- it's documented as a
-        deliberate no-op today (pre-OBJ-005)."""
-        from app.core import notifications
-
-        result = notifications.send_otp_notification(
-            "seam-direct-call@example.com", "123456", purpose="reset_password"
-        )
-        assert result is None, (
-            "send_otp_notification is documented as a deliberate no-op "
-            "today (design notes section 5.1: 'Deliberately a no-op today "
-            "-- no delivery channel exists yet') -- OBJ-005 replaces the "
-            "BODY, not this contract"
-        )
-
-
-async def test_forgot_password_calls_the_notification_seam_with_the_real_otp(
+async def test_forgot_password_sends_an_email_with_the_real_otp_via_email_sender(
     client, api_prefix, user_factory
 ):
-    """Drives the real /auth/forgot-password endpoint with the seam
-    mocked, and confirms it's actually wired into the call site design
-    notes section 5.1 specifies -- not just present, unused, elsewhere in
-    the module.
+    """Drives the real /auth/forgot-password endpoint with a recording
+    EmailSender injected via dependency override, and confirms it's
+    actually wired into the endpoint -- not just present, unused, elsewhere
+    in the module. Same dependency-override pattern already established in
+    tests/api/test_resend_verification_email.py. `app.dependency_overrides`
+    is reset automatically after each test (tests/conftest.py autouse
+    fixture)."""
 
-    PATCH-TARGET COUPLING, flagged explicitly (same class of naming-
-    coupling risk already established for _build_ssl_connect_arg in
-    OBJ-003): this patches
-    "app.api.v1.endpoints.auth.notifications.send_otp_notification",
-    assuming auth.py imports the module itself (`from app.core import
-    notifications`) and calls `notifications.send_otp_notification(...)` --
-    the exact style already used for `rate_limit` in this same file
-    (`from app.core import rate_limit` / `rate_limit.enforce_rate_limit(...)`).
-    If `developer` instead does `from app.core.notifications import
-    send_otp_notification`, this patch target needs updating to
-    "app.api.v1.endpoints.auth.send_otp_notification" -- not a behavioral
-    regression, a naming-coupling issue only.
-    """
+    class _RecordingEmailSender:
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, *, to, subject, body, html_body=None):
+            self.calls.append({"to": to, "subject": subject, "body": body})
+
+    sender = _RecordingEmailSender()
+    app.dependency_overrides[deps.get_email_sender] = lambda: sender
+
     user, _ = await user_factory(email="seam-call-site@example.com")
 
-    with patch(
-        "app.api.v1.endpoints.auth.notifications.send_otp_notification"
-    ) as mock_send:
-        resp = await client.post(
-            f"{api_prefix}/auth/forgot-password", json={"email": user.email}
-        )
+    resp = await client.post(
+        f"{api_prefix}/auth/forgot-password", json={"email": user.email}
+    )
 
     assert resp.status_code == 200
-    mock_send.assert_called_once()
-    call_args = mock_send.call_args
-    # email must be the real user's email, and the otp arg must look like
-    # a real 6-digit OTP (never a hardcoded/known value -- there is no
-    # other channel this test could have learned it from ahead of time).
-    all_args = list(call_args.args) + list(call_args.kwargs.values())
-    assert user.email in all_args, (
-        f"send_otp_notification must be called with the real user's "
-        f"email, got args={call_args.args} kwargs={call_args.kwargs}"
+    assert len(sender.calls) == 1, (
+        f"expected /auth/forgot-password to call EmailSender.send exactly "
+        f"once, got {len(sender.calls)} call(s)"
     )
-    otp_candidates = [
-        a for a in all_args if isinstance(a, str) and a.isdigit() and len(a) == 6
-    ]
+    call = sender.calls[0]
+    # email must be the real user's email, and the body must contain a
+    # 6-digit OTP that looks real (never a hardcoded/known value -- there
+    # is no other channel this test could have learned it from ahead of
+    # time).
+    assert call["to"] == user.email, (
+        f"EmailSender.send must be called with the real user's email, got "
+        f"to={call['to']!r}"
+    )
+    otp_candidates = re.findall(r"\d{6}", call["body"])
     assert len(otp_candidates) == 1, (
-        f"send_otp_notification must be called with a 6-digit OTP string "
-        f"argument, got args={call_args.args} kwargs={call_args.kwargs}"
+        f"EmailSender.send must be called with a body containing exactly "
+        f"one 6-digit OTP string, got body={call['body']!r}"
     )

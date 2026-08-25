@@ -30,31 +30,24 @@ OBJ-004 UPDATE (2026-08-24, qa-engineer, required non-optional carry-over
 per obj-004-design-notes.md section 5.2 / dependency_graph.md's OBJ-004
 Phase 1 section): this file ORIGINALLY recovered the real OTP via `capsys`
 against the debug `print(...)`-based mock email sender in
-`/auth/forgot-password`. OBJ-004 finding #10 (part 2) removes that print
-statement entirely and replaces it with `app.core.notifications.
-send_otp_notification(email, otp, *, purpose)` -- a monkeypatchable no-op
-seam (Gate 1 APPROVED decision 3). This file's own docstring already
-anticipated this exact breakage (OBJ-003's qa-engineer pass flagged it as a
-known forward risk, not a surprise) and is updated HERE, in the same OBJ-004
-Phase 2 pass that removes the print, per the design notes' own mandate:
-"Required, non-optional carry-over for qa-engineer's OBJ-004 Phase 2 pass:
-tests/api/test_otp_hashing_integration.py must switch from capsys-based
-stdout capture to unittest.mock.patch(...) ... reading the real OTP from the
-mock's call arguments instead."
+`/auth/forgot-password`. OBJ-004 finding #10 (part 2) removed that print
+statement and replaced it with `app.core.notifications.
+send_otp_notification(email, otp, *, purpose)`, a monkeypatchable no-op
+seam.
 
-`_forgot_password_and_capture_real_otp` below now patches
-`app.api.v1.endpoints.auth.notifications.send_otp_notification` for the
-duration of the `/forgot-password` call and reads the real OTP out of the
-mock's call arguments -- never a hardcoded/known plaintext value, same
-no-known-plaintext discipline as before, just a different (non-stdout)
+CHORE UPDATE (2026-08-26, developer, audit-report.md "notifications.py/
+EmailSender coexisting" finding, obj-005-design-notes.md section 4.1's
+originally-designed end state): `/auth/forgot-password` is now migrated
+onto the `EmailSender` abstraction (`render_password_reset_email` +
+`email_sender.send(...)`), matching every other OTP-delivery call site.
+`app/core/notifications.py` is retired. `_forgot_password_and_capture_real_otp`
+below now overrides `deps.get_email_sender` with a recording fake for the
+duration of the `/forgot-password` call and recovers the real OTP from the
+rendered email body -- same no-known-plaintext discipline as before
+(matches the dependency-override pattern already established in
+tests/api/test_resend_verification_email.py), just a different (non-seam)
 recovery channel. No test's ASSERTIONS changed, only the mechanism used to
-learn the real OTP value; this is a testability-mechanism fix, not a
-weakening of what's being verified. PATCH-TARGET COUPLING note: see
-tests/unit/test_otp_debug_print_removed.py's
-test_forgot_password_calls_the_notification_seam_with_the_real_otp for the
-full explanation of the assumed `from app.core import notifications` /
-`notifications.send_otp_notification(...)` import style this patch target
-depends on.
+learn the real OTP value.
 
 Requires Postgres -- see tests/README.md / tests/conftest.py module
 docstring.
@@ -70,43 +63,48 @@ the model/auth.py changes database-architect's own review already scoped.
 """
 
 import re
-from unittest.mock import patch
 
 from sqlalchemy import select
 
+from app.api import deps
 from app.core import security
+from app.main import app
 from app.models.verification import Verification
 
-_NOTIFICATION_SEAM_PATCH_TARGET = (
-    "app.api.v1.endpoints.auth.notifications.send_otp_notification"
-)
+
+class _RecordingEmailSender:
+    """Test double matching the pattern established in
+    tests/api/test_resend_verification_email.py -- records every send
+    instead of actually delivering anything."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def send(self, *, to, subject, body, html_body=None):
+        self.calls.append({"to": to, "subject": subject, "body": body})
 
 
 async def _forgot_password_and_capture_real_otp(client, api_prefix, email) -> str:
-    """Drives the real /auth/forgot-password endpoint with the OTP delivery
-    seam mocked, and returns the real, freshly-issued OTP recovered from the
-    mock's call arguments -- never a hardcoded/known plaintext value.
-    """
-    with patch(_NOTIFICATION_SEAM_PATCH_TARGET) as mock_send:
-        resp = await client.post(f"{api_prefix}/auth/forgot-password", json={"email": email})
-        assert resp.status_code == 200, resp.text
+    """Drives the real /auth/forgot-password endpoint with a recording
+    EmailSender injected via dependency override, and returns the real,
+    freshly-issued OTP recovered from the rendered email body -- never a
+    hardcoded/known plaintext value. `app.dependency_overrides` is reset
+    automatically after each test (tests/conftest.py autouse fixture)."""
+    sender = _RecordingEmailSender()
+    app.dependency_overrides[deps.get_email_sender] = lambda: sender
 
-    assert mock_send.called, (
-        "app.core.notifications.send_otp_notification must be called by "
-        "/auth/forgot-password when a fresh OTP is issued -- it was not "
-        "called at all, so no real OTP could be recovered for this test "
-        "(see tests/unit/test_otp_debug_print_removed.py for the dedicated "
-        "test of this call site)"
+    resp = await client.post(f"{api_prefix}/auth/forgot-password", json={"email": email})
+    assert resp.status_code == 200, resp.text
+
+    assert len(sender.calls) == 1, (
+        f"expected /auth/forgot-password to send exactly one email when a "
+        f"fresh OTP is issued, got {len(sender.calls)} send(s)"
     )
-    call_args = mock_send.call_args
-    all_args = list(call_args.args) + list(call_args.kwargs.values())
-    otp_candidates = [
-        a for a in all_args if isinstance(a, str) and a.isdigit() and len(a) == 6
-    ]
+    body = sender.calls[0]["body"]
+    otp_candidates = re.findall(r"\d{6}", body)
     assert len(otp_candidates) == 1, (
-        f"expected exactly one 6-digit OTP string argument passed to "
-        f"send_otp_notification, got args={call_args.args} "
-        f"kwargs={call_args.kwargs}"
+        f"expected exactly one 6-digit OTP string embedded in the rendered "
+        f"password-reset email body, got body={body!r}"
     )
     return otp_candidates[0]
 
