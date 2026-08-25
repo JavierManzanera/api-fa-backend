@@ -1,7 +1,7 @@
 # OBJ-013 — Rate Limiter Keying Hardening — Design Notes
 
 > **Summary (read this, skip the rest unless you need detail):**
-> - **Status:** Gate 1 (design only) — no red tests written yet, no implementation. `rate_limit.py` itself is untouched by this doc; `qa-engineer` (red phase) and `developer` (green phase) pick up next.
+> - **Status:** Gate 1 design + Gate 2 red phase + Gate 3 implementation all complete as of 2026-08-25 (see §8 for the implementation note) — `app/core/rate_limit.py` and `app/core/config.py` now match §3's spec, all 8 targeted tests green, full suite 303/303 passed.
 > - **Finding closed:** audit-report.md **#17** (LOW, filed Gate 3 OBJ-009) — `enforce_rate_limit`'s `(scope, ip, email)` key is an AND, not independent counters, so rotating either `ip` or `email` alone resets the attacker to a fresh zero-count bucket every request.
 > - **Fix shape (Option (a) chosen):** replace the single combined `(scope, ip, email)` COUNT with **two independent COUNT queries** per call — one keyed on `(scope, ip)`, one keyed on `(scope, email)` — both against the trailing window; either one reaching its own limit is a 429. An attacker now needs to defeat BOTH dimensions simultaneously (unique IP *and* unique email on every single request) to evade throttling, not just one.
 > - **Signature change:** `limit: int` is kept (no rename) and now means the **email-keyed** threshold, unchanged in value from today, at all 6 call sites. A new optional `ip_limit: int | None = None` defaults to `limit * settings.RATE_LIMIT_IP_MULTIPLIER` (new setting, default `5`) when omitted. **Zero call-site diffs required** — all 6 existing `enforce_rate_limit(...)` calls keep compiling and keep their current behavior for the email dimension; the IP-only check is added automatically and centrally.
@@ -19,6 +19,7 @@
 - [§5 — OpenAPI contract impact: none](#5--openapi-contract-impact-none) — why the `429` shape is unchanged and no spec edit was made.
 - [§6 — Residual risk and backlog](#6--residual-risk-and-backlog) — what this fix does NOT solve, stated explicitly.
 - [§7 — Architectural boundaries](#7--architectural-boundaries) — unchanged by this objective; restated for completeness.
+- [§8 — Implementation note (2026-08-25, developer)](#8--implementation-note-2026-08-25-developer) — what was built, final green test count, zero-regression confirmation.
 
 ---
 
@@ -192,3 +193,30 @@ Unchanged by this objective — restated for completeness, per this role's conve
 - `app/core/audit_log.py` remains the single owner of the structured auth-event log line shape; this design adds one new field (`dimension`) to an existing event type (`auth.rate_limit.exceeded`), not a new event type or a new logging mechanism.
 - `app/core/config.py` remains the single owner of runtime-tunable settings; this design adds one new setting (`RATE_LIMIT_IP_MULTIPLIER`) following the existing `TRUSTED_PROXY_COUNT`/`LOG_LEVEL` convention (safe default, live-read at call time, no startup-fail-closed requirement — a misconfigured multiplier affects rate-limit generosity, not security posture in the fail-open/fail-closed sense `SECRET_KEY`/`POSTGRES_SSL_MODE` are held to).
 - `docs/api/openapi.yaml` is unchanged (§5) — no new architectural surface, this is an internal hardening of an existing mechanism.
+
+## §8 — Implementation note (2026-08-25, developer)
+
+Built exactly per §3's spec, with one naming difference: the private helper
+is `_raise_rate_limited` (not `_raise_rate_limit_exceeded` or similar) —
+functionally identical to §3's pseudocode, including the `dimension`
+audit-log-only field. `app/core/rate_limit.py`'s `enforce_rate_limit` now
+runs the IP-only check before the email-only check (as §3 recommended,
+"cheaper-to-reason-about dimension first" — no functional difference either
+order). `RATE_LIMIT_IP_MULTIPLIER: int = 5` added to `app/core/config.py`
+in the `TRUSTED_PROXY_COUNT`/`LOG_LEVEL` section, same convention. Zero
+call-site diffs at all 6 endpoints, confirmed via `grep -rn
+"enforce_rate_limit(" app/api/v1/endpoints/auth.py` before and after (still
+6 call sites, all unchanged).
+
+Confirmed red before implementing: `tests/unit/test_rate_limit_ip_multiplier_setting.py`
+(1 test, `AttributeError`) and 3 of `tests/api/test_rate_limit_keying.py`'s
+7 tests (`TestEmailRotationBypassNowClosed` x2, `TestDimensionParitySymmetric`
+x1) — the other 4 tests in that file are regression guards that were
+already green, per qa-engineer's test report §3/§4. All 8 targeted tests
+green after implementation. Full suite: **303 passed, 0 failed** (was 299
+passed / 4 failed before this change) — zero regressions, against a
+disposable local Postgres 16 (`initdb`/`pg_ctl`, port 5544).
+
+No `app/api/v1/endpoints/auth.py` diff. No `openapi.yaml` diff (per §5).
+`database-architect`'s flagged index follow-up (§4) not applied here —
+still open, tracked separately.

@@ -33,42 +33,90 @@ async def enforce_rate_limit(
     ip: str,
     email: str,
     limit: int,
+    ip_limit: int | None = None,
     window_seconds: int = DEFAULT_WINDOW_SECONDS,
 ) -> None:
-    """Raise 429 (with Retry-After) once `limit` requests for this
-    (scope, ip, email) key have landed within the trailing `window_seconds`;
-    otherwise record the current request and let the caller proceed.
+    """Raise 429 if EITHER the IP-only or the email-only sliding-window
+    count for `scope` within `window_seconds` has reached its own
+    independent limit; otherwise record the current request (one row,
+    same shape as today -- both `ip` and `email` still stored for
+    forensics) and let the caller proceed.
+
+    Two independent counts, not one combined (scope, ip, email) count --
+    closes audit finding #17 (obj-013-design-notes.md): an attacker who
+    rotates only ONE of (ip, email) must still contend with the OTHER
+    dimension's own limit, instead of resetting to a fresh zero-count
+    bucket on every request.
+
+    `limit` keeps its pre-OBJ-013 meaning: the email-keyed threshold,
+    unchanged at all 6 call sites. `ip_limit` is new and optional --
+    defaults to `limit * settings.RATE_LIMIT_IP_MULTIPLIER` (read live at
+    call time, not captured at import time) when the caller doesn't
+    override it, so all 6 existing call sites get the IP-only check for
+    free with zero call-site diffs.
     """
+    resolved_ip_limit = ip_limit if ip_limit is not None else limit * settings.RATE_LIMIT_IP_MULTIPLIER
+
     now = datetime.now(timezone.utc)
     window_start = now - timedelta(seconds=window_seconds)
 
-    result = await db.execute(
+    ip_hits = await db.execute(
         select(func.count())
         .select_from(RateLimitHit)
         .where(
             RateLimitHit.scope == scope,
             RateLimitHit.ip == ip,
+            RateLimitHit.created_at > window_start,
+        )
+    )
+    if ip_hits.scalar_one() >= resolved_ip_limit:
+        await _raise_rate_limited(scope=scope, ip=ip, email=email, window_seconds=window_seconds, dimension="ip")
+
+    email_hits = await db.execute(
+        select(func.count())
+        .select_from(RateLimitHit)
+        .where(
+            RateLimitHit.scope == scope,
             RateLimitHit.email == email,
             RateLimitHit.created_at > window_start,
         )
     )
-    hits_in_window = result.scalar_one()
-
-    if hits_in_window >= limit:
-        # OBJ-004 finding #10 (obj-004-design-notes.md section 4.2):
-        # auth.rate_limit.exceeded, WARNING -- a genuine security signal
-        # worth a human noticing, not routine traffic.
-        audit_log.log_auth_event(
-            "auth.rate_limit.exceeded", level=logging.WARNING, scope=scope, ip=ip, email=email
-        )
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests. Please try again later.",
-            headers={"Retry-After": str(window_seconds)},
-        )
+    if email_hits.scalar_one() >= limit:
+        await _raise_rate_limited(scope=scope, ip=ip, email=email, window_seconds=window_seconds, dimension="email")
 
     db.add(RateLimitHit(scope=scope, ip=ip, email=email, created_at=now))
     await db.commit()
+
+
+async def _raise_rate_limited(
+    *, scope: str, ip: str, email: str, window_seconds: int, dimension: str
+) -> None:
+    """Shared 429 path for both the IP-only and email-only checks above.
+
+    `dimension` ("ip" or "email") is logged for security-monitoring
+    visibility only -- OBJ-013 design notes section 3: it must NEVER reach
+    the HTTP response (body or headers), which stay byte-for-byte identical
+    regardless of which dimension tripped. Differentiating the wire
+    response would create a new oracle (OBJ-007 finding #6's
+    anti-enumeration property), so `dimension` is not passed to
+    HTTPException below, only to the audit log.
+    """
+    # OBJ-004 finding #10 (obj-004-design-notes.md section 4.2):
+    # auth.rate_limit.exceeded, WARNING -- a genuine security signal
+    # worth a human noticing, not routine traffic.
+    audit_log.log_auth_event(
+        "auth.rate_limit.exceeded",
+        level=logging.WARNING,
+        scope=scope,
+        ip=ip,
+        email=email,
+        dimension=dimension,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail="Too many requests. Please try again later.",
+        headers={"Retry-After": str(window_seconds)},
+    )
 
 
 def client_ip(request) -> str:

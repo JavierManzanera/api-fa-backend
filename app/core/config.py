@@ -108,6 +108,16 @@ class Settings(BaseSettings):
     # today's existing (unconfigured) behavior.
     TRUSTED_PROXY_COUNT: int = 0
 
+    # OBJ-013 (obj-013-design-notes.md section 2/3): multiplier applied to a
+    # scope's email-keyed `limit` to derive the default IP-keyed threshold
+    # when a call site doesn't override it via `ip_limit`. Deliberately more
+    # generous than the email-keyed limit -- shared/NAT'd/corporate-proxy
+    # IPs are normal legitimate traffic; see design notes section 2 for why
+    # this exact value needs user sign-off before changing. Safe default
+    # (misconfiguration only affects rate-limit generosity, not security
+    # posture), same convention as TRUSTED_PROXY_COUNT/LOG_LEVEL above.
+    RATE_LIMIT_IP_MULTIPLIER: int = 5
+
     # OBJ-005 (obj-005-design-notes.md section 4.5): which EmailSender
     # implementation app.api.deps.get_email_sender() wires up. Safe default
     # ("console" -- always works, never fails) matching LOG_LEVEL's
