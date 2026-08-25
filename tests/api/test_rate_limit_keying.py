@@ -71,6 +71,7 @@ VERIFY_OTP_EMAIL_LIMIT = 10
 # Design notes section 2/3: new settings.RATE_LIMIT_IP_MULTIPLIER default.
 RATE_LIMIT_IP_MULTIPLIER = 5
 REGISTER_IP_LIMIT = REGISTER_EMAIL_LIMIT * RATE_LIMIT_IP_MULTIPLIER  # 25
+FORGOT_PASSWORD_IP_LIMIT = FORGOT_PASSWORD_EMAIL_LIMIT * RATE_LIMIT_IP_MULTIPLIER  # 25
 
 
 async def _register(client, api_prefix, email, password=VALID_PASSWORD, headers=None):
@@ -322,4 +323,81 @@ class TestDimensionParitySymmetric:
         ), (
             "the Retry-After value itself must not differ between dimensions -- "
             "both checks share the same window_seconds (design notes section 5)"
+        )
+
+
+# ----------------------------------------------------------------------------
+# Point 5 -- Gate 3 verification gap-fill (2026-08-25, qa-engineer): the
+# TestDimensionParitySymmetric class above proves the two 429s are EQUAL to
+# each other, which is the property that matters for the anti-oracle
+# guarantee, but it never pins down WHAT that shared shape actually is or
+# asserts the `dimension` field's name is absent by construction. These two
+# tests close that gap directly rather than only by inference:
+#   (a) the IP-triggered 429 body is EXACTLY the documented generic shape
+#       (docs/api/openapi.yaml's RateLimited component) with no extra keys
+#       -- in particular no `dimension` key -- not just "equal to the other
+#       one".
+#   (b) the fix is centralized, not something that only happens to work at
+#       /register: a SECOND, independent endpoint (/forgot-password) also
+#       enforces its own IP-only check at limit x RATE_LIMIT_IP_MULTIPLIER.
+#       auth.py's diff for OBJ-013 (commit 78d0f66) touches zero lines in
+#       any endpoint handler -- confirmed via `git show 78d0f66 --stat` --
+#       so this is a belt-and-suspenders proof of that structural claim
+#       against a second call site, not a redundant re-test of /register.
+# ----------------------------------------------------------------------------
+
+
+class TestNoNewOracleExplicitBodyShape:
+    async def test_ip_triggered_429_body_has_no_dimension_key_and_matches_documented_shape(
+        self, client, api_prefix
+    ):
+        for i in range(REGISTER_IP_LIMIT):
+            await _register(client, api_prefix, f"oracle-shape-{i}@example.com")
+
+        resp = await _register(client, api_prefix, "oracle-shape-final@example.com")
+
+        assert resp.status_code == 429, resp.text
+        assert resp.json() == {"detail": "Too many requests. Please try again later."}, (
+            f"the IP-triggered 429 body must be EXACTLY the documented generic "
+            f"RateLimited shape (openapi.yaml) with no additional keys -- in "
+            f"particular the internal `dimension` field (design notes section 3) "
+            f"must never appear on the wire -- got {resp.json()!r}"
+        )
+        assert "dimension" not in resp.text.lower(), (
+            f"the literal string 'dimension' must not appear anywhere in the "
+            f"response body text -- got {resp.text!r}"
+        )
+
+
+class TestFixCentralizedAcrossEndpoints:
+    async def test_forgot_password_ip_only_check_also_throttles_at_26th_distinct_email(
+        self, client, api_prefix
+    ):
+        """Same shape as TestEmailRotationBypassNowClosed but against a
+        SECOND endpoint, to prove the IP-only check is genuinely centralized
+        in enforce_rate_limit and not something only exercised/working at
+        /register (the endpoint every other test in this file happens to
+        use). /forgot-password never validates the email against an
+        existing account before the rate-limit check runs (anti-enumeration,
+        OBJ-007 finding #6), so distinct never-used emails are as trivial to
+        construct here as at /register."""
+        statuses = []
+        for i in range(FORGOT_PASSWORD_IP_LIMIT + 1):
+            resp = await client.post(
+                f"{api_prefix}/auth/forgot-password",
+                json={"email": f"fp-ip-rotation-{i}@example.com"},
+            )
+            statuses.append(resp.status_code)
+
+        assert statuses[:FORGOT_PASSWORD_IP_LIMIT] == [200] * FORGOT_PASSWORD_IP_LIMIT, (
+            f"expected the first {FORGOT_PASSWORD_IP_LIMIT} requests (each a "
+            f"distinct, never-repeated email from the same real IP) to succeed "
+            f"-- got {statuses}"
+        )
+        assert statuses[FORGOT_PASSWORD_IP_LIMIT] == 429, (
+            f"the {FORGOT_PASSWORD_IP_LIMIT + 1}th request from the SAME real IP "
+            f"to a SECOND endpoint must also be throttled by the IP-only check "
+            f"even though no single email repeated -- got status sequence "
+            f"{statuses}. Confirms the fix is centralized in enforce_rate_limit, "
+            f"not accidentally only working at /register."
         )

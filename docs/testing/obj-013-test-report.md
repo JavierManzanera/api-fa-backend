@@ -17,6 +17,57 @@
 - [§4 — What's GREEN today, and why that's correct](#4--whats-green-today-and-why-thats-correct) — 4 regression-guard tests, each traced to why current code already satisfies them.
 - [§5 — Full suite result](#5--full-suite-result) — 294 total, 290 passed, 4 failed, exact commands.
 - [§6 — Out of scope](#6--out-of-scope) — what this pass deliberately did not touch or assert.
+- [§7 — Gate 3 verification (2026-08-25, qa-engineer)](#7--gate-3-verification-2026-08-25-qa-engineer) — final PASS verdict, implementation review, 2 new coverage-gap tests, full-suite confirmation.
+
+---
+
+## §7 — Gate 3 verification (2026-08-25, qa-engineer)
+
+> **Summary:**
+> - **Verdict: PASS.** Closes audit finding #17. Implementation (`app/core/rate_limit.py`, `app/core/config.py`, commit `78d0f66`) matches `docs/api/obj-013-design-notes.md` §3 exactly.
+> - All 8 previously-red tests confirmed green in isolation (`tests/api/test_rate_limit_keying.py` + `tests/unit/test_rate_limit_ip_multiplier_setting.py`, 8 passed).
+> - **2 new tests added** to close coverage gaps not fully pinned down by the Gate 2 suite (both green): an explicit no-oracle body-shape assertion, and a cross-endpoint (`/forgot-password`) generalization proof that the fix is centralized, not `/register`-specific.
+> - **Full suite (this branch, `obj-013-gate3-qa` off `origin/obj-010-013-residual-hardening`): 306 passed, 0 failed, 0 errors** (304 pre-existing on this integration branch + 2 new). Zero regressions.
+> - Implementation critically reviewed line-by-line against design §3 (not just trusted via green tests) — see below for each specific claim checked.
+> - Environment: this worktree's own `.venv` (Python 3.11.8, `requirements-dev.lock.txt`), disposable Postgres 16 via `initdb`/`pg_ctl` (port 5544, `trust` auth, own data directory outside the repo, torn down after this pass). No blocker this pass — `greenlet` imports cleanly (v3.5.5) in this environment, unlike the OBJ-006 pass's Windows Application Control block noted in `tests/README.md`.
+
+### Implementation review against design doc §3
+
+Read `app/core/rate_limit.py` and `app/core/config.py` in full, and diffed commit `78d0f66` against `origin/main`'s `app/api/v1/endpoints/auth.py`, rather than relying on green tests alone:
+
+1. **Two independent sliding-window checks, not one AND-keyed query** — confirmed: `enforce_rate_limit` (lines 63-88) runs a `(scope, ip)`-only COUNT, then a `(scope, email)`-only COUNT, either sufficient to 429. Matches §3's pseudocode exactly, including checking `ip` before `email` (design's own noted "no functional difference either order" choice).
+2. **429 response byte-for-byte identical regardless of dimension ("no new oracle")** — confirmed both structurally and by test. Structurally: `_raise_rate_limited` (lines 91-119) builds the `HTTPException` from a fixed literal `detail` string and a `headers={"Retry-After": str(window_seconds)}` dict that never references `dimension` — there is no code path by which `dimension` could vary the HTTP response. `TestDimensionParitySymmetric` (Gate 2) proves the two responses are *equal to each other*; the new `TestNoNewOracleExplicitBodyShape` test (added this pass) additionally pins down that the IP-triggered body is *exactly* `{"detail": "Too many requests. Please try again later."}` with no extra keys, and that the literal string `"dimension"` never appears in the response text. Both pass.
+3. **`dimension` is audit-log-only, never reaches the wire** — confirmed. `dimension` is passed only into `audit_log.log_auth_event(...)` (line 113), which (read in full, `app/core/audit_log.py`) does nothing but `json.dumps` into a stdlib `logging` call — no return value, no response mutation, entirely disjoint from the `HTTPException` raised immediately after. There is no route by which this value could leak onto the wire; the design's own §3 instruction is satisfied by construction, not just by convention.
+4. **All 6 call sites genuinely untouched** — confirmed via `git show 78d0f66 --stat`: the commit's file list is `app/core/config.py`, `app/core/rate_limit.py`, `docs/api/obj-013-design-notes.md` only — `app/api/v1/endpoints/auth.py` does not appear in the diff at all, i.e. zero lines changed, not just zero *semantic* changes. Independently re-confirmed via `grep -c "enforce_rate_limit(" app/api/v1/endpoints/auth.py` → 6, and `grep -n "ip_limit" app/api/v1/endpoints/auth.py` → no matches (no call site passes the new optional parameter).
+5. **IP-keyed default multiplier (5×) applied correctly when a call site doesn't override `ip_limit`** — confirmed by both math and behavior. `resolved_ip_limit = ip_limit if ip_limit is not None else limit * settings.RATE_LIMIT_IP_MULTIPLIER` (line 58); since no call site passes `ip_limit` (point 4), every scope always takes the `limit * 5` branch. Behaviorally proven at two independent endpoints with different email limits: `/register` (email limit 5 → IP limit 25, `TestEmailRotationBypassNowClosed`) and, new this pass, `/forgot-password` (email limit 5 → IP limit 25, `TestFixCentralizedAcrossEndpoints`) — both trip exactly at the 26th distinct-email request from one IP, not before.
+6. **`RATE_LIMIT_IP_MULTIPLIER` setting** — `app/core/config.py:119`, `int = 5`, in the `TRUSTED_PROXY_COUNT`/`LOG_LEVEL` section as the design specified; read live via `settings.RATE_LIMIT_IP_MULTIPLIER` at call time (not captured at import), confirmed by the passing `test_rate_limit_ip_multiplier_setting_defaults_to_five` unit test.
+7. **`RateLimitHit` row shape / write path unchanged** — confirmed: `db.add(RateLimitHit(scope=scope, ip=ip, email=email, created_at=now))` (line 87) is identical in shape to the pre-fix write; only the two read-side COUNT queries changed, matching §3's explicit note.
+
+No gap found in the *implementation* itself against the design doc. The two gaps found were in *test coverage granularity* (points 2 and 5 above were provable only by composing two existing Gate 2 tests' evidence, not by a single direct assertion) — closed by the 2 new tests below, not by any code change.
+
+### New coverage added this pass
+
+Both appended to `tests/api/test_rate_limit_keying.py` (kept in the same file as the Gate 2 suite — same module, same fixtures/constants, consistent with the file's existing "Point N" section convention):
+
+- **`TestNoNewOracleExplicitBodyShape::test_ip_triggered_429_body_has_no_dimension_key_and_matches_documented_shape`** — direct assertion that the IP-triggered 429 body equals the exact documented `RateLimited` shape (`{"detail": "Too many requests. Please try again later."}`) with no extra keys, and that the literal string `"dimension"` is absent from the response text. Gate 2's `TestDimensionParitySymmetric` only proved the two dimensions' responses are equal to *each other*, which is the property that actually matters for the anti-oracle guarantee but doesn't independently pin down that neither one leaks `dimension` (two responses could in principle both leak the same thing and still be "equal" — not the case here, but this test makes that not-the-case fact explicit rather than left to inference).
+- **`TestFixCentralizedAcrossEndpoints::test_forgot_password_ip_only_check_also_throttles_at_26th_distinct_email`** — same IP-rotation-bypass shape as Gate 2's `TestEmailRotationBypassNowClosed`, run against `/forgot-password` instead of `/register`. Gate 2's suite exercised the IP-only check exclusively through `/register` (the newest, just-merged-via-OBJ-009 endpoint); this test independently confirms the fix is genuinely centralized in `enforce_rate_limit` (as design §7 claims) by proving it at a second, structurally different call site, rather than resting that claim solely on the `git diff`-based "zero call-site changes" evidence.
+
+Both pass. No implementation change was needed to make them pass — they exercise behavior the Gate 3 implementation already provides.
+
+### Full suite result
+
+```
+TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5544/api_fa_test \
+  .venv/Scripts/python -m pytest -q
+```
+
+Run 1 (before adding the 2 new tests, confirming the developer's own reported count plus later integration-branch additions): **304 passed, 0 failed** — 1 more than the design doc §8's self-reported 303, traced to `docs/testing/obj-010-test-report.md`'s Gate 3 pass (commit `03b14f0`, merged onto this integration branch after `78d0f66`) adding one further test closing a response-body oracle gap for OBJ-010; not a discrepancy, just later work on the same integration branch.
+
+Run 2 (after adding the 2 new tests): **306 passed, 0 failed, 0 errors, 161.14s.** Zero regressions across the whole suite, not just this objective's own tests.
+
+### Verdict
+
+**PASS.** Finding #17 is closed: the AND-keyed `(scope, ip, email)` bypass is replaced with two genuinely independent checks, verified both by reading the implementation against the design spec and by executing (and, where a gap was found in test-coverage granularity rather than implementation, extending) the test suite. Recommended for inclusion in the consolidated OBJ-010/011/012/013 PR to `main`.
 
 ---
 
