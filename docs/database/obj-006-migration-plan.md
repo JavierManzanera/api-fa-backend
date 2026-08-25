@@ -20,11 +20,19 @@ explicitly deferred, not a migration (§5) · 7 Gate-1 tradeoffs, all APPROVED 2
 "Gate 1 — APPROVED" below) · devops-engineer handoff list (§8, superseded/extended by the second
 "Handoff" section near the bottom, post-migration-authorship). **Read this if you only have time
 for one thing:** "CRITICAL finding: migration 0008 breaks the current `/auth/refresh` handler" —
-migration 0008 is written but NOT SAFE TO DEPLOY past 0007 until `developer` reorders that
-handler. Jump to: "1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role
-separation", "4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item",
-"7. Gate-1 open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration
-authorship", "CRITICAL finding", "Environment blocker: greenlet".
+**RESOLVED as of OBJ-010 (2026-08-25): `developer` reordered the handler (commit `f1758a5`), CI is
+unpinned to head, migration 0008 is now safe to deploy** — see that section's own "FIXED" note and
+the later "CI unpinned from 0007 to head" section for the two confirmation passes. Jump to:
+"1. Current schema state", "2. Alembic migration sequence", "3. DDL vs. DML role separation",
+"4. Scheduled cleanup jobs", "5. Row-locking / TOCTOU hardening", "6. Cosmetic item", "7. Gate-1
+open questions", "8. Handoff to devops-engineer", "Gate 1 — APPROVED", "Migration authorship",
+"CRITICAL finding" (+ its "FIXED" sub-note), "Environment blocker: greenlet", "devops-engineer pass
+(2026-08-25)", "database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)",
+"CI unpinned from 0007 to head" (OBJ-010, this pass — CI now runs migration 0008/head,
+independently re-verified: clean `alembic upgrade head` + 281 passed).
+"OBJ-014 — rate_limit_hits index follow-up" (2026-08-26, database-architect — migration 0009 adds
+`ix_rate_limit_hits_scope_email_created_at_ip`, EXPLAIN ANALYZE-verified; existing index left
+untouched, deviated from the OBJ-014 design doc's suggested column order — see that section for why).
 
 **Backlog items covered, traced to their source** (all read directly from
 `.ai-context/dependency_graph.md`'s OBJ-006 row and the OBJ-001/002/003 database-architect review
@@ -570,6 +578,29 @@ this plan's §5, since both touch the same code). **Until that lands: stop at
 docstring carries this warning. `devops-engineer`: do not wire 0008 into any automated deploy step
 until a `developer` pass clears this.
 
+### FIXED (2026-08-25, developer, OBJ-010, commit `f1758a5`)
+
+`app/api/v1/endpoints/auth.py`'s `/auth/refresh` handler now does revoke→insert→link, exactly the
+validated shape above: (1) an atomic `UPDATE refresh_sessions SET revoked_at = :now WHERE id = :jti
+AND revoked_at IS NULL` on the old row (repeats the `revoked_at IS NULL` predicate — also closes the
+§5 TOCTOU gap: 0 rows affected now fails the refresh closed with a 401 instead of proceeding), then
+(2) `_issue_tokens_and_session` inserts the new row + `flush()`, then (3) a second `UPDATE` sets the
+old row's `replaced_by` to the new row's id. Combined with the TOCTOU fix per this doc's own
+recommendation, same code, same commit.
+
+Verified end-to-end against a disposable local Postgres 16 (`initdb`/`pg_ctl`, port 5434 to avoid a
+concurrent worktree's instance already on 5433) migrated all the way through `alembic upgrade head`
+(0008 included): reproduced the exact `duplicate key value violates unique constraint
+"ux_refresh_sessions_family_id_active"` failure this section describes against the pre-fix handler
+(4/6 `tests/api/test_refresh_rotation.py` tests failed), then confirmed the fix clears it — full
+suite **281 passed** (279 previously-existing + 2 new OBJ-010 tests:
+`test_obj010_multiple_sequential_rotations_do_not_violate_family_unique_constraint` rotates a session
+5x in a row against the 0008-migrated schema; `test_obj010_concurrently_revoked_session_fails_closed_on_refresh`
+simulates the TOCTOU race and asserts a 401 fail-closed). Also re-ran the full suite against the
+normal `create_all` schema CI actually uses today (no `TEST_DB_SCHEMA_SOURCE=alembic`): same **281
+passed**, zero regressions. 0008 is now safe to include when `database-architect`/`devops-engineer`
+next move CI's pinning off `0007`.
+
 ## Environment blocker: `greenlet` blocked by Windows Application Control (2026-08-24)
 
 `import greenlet` fails with `ImportError: DLL load failed... An Application Control policy has
@@ -625,3 +656,169 @@ and need a `developer`/`database-architect` follow-up, not a devops-engineer one
 Also fixed in passing (blocked `alembic upgrade` entirely, in any environment, not just CI):
 `alembic/env.py`'s placeholder-`Settings` block predated `ENVIRONMENT` (OBJ-004, no default) —
 added `os.environ.setdefault("ENVIRONMENT", "development")` alongside the existing placeholders.
+
+## database-architect pass — OBJ-011 greenfield role provisioning fix (2026-08-25)
+
+**Decision made** (this doc's own prior section left it explicitly undecided, point 2 above):
+`docs/database/sql/provision_db_roles.sql` is now split the same way as
+`scripts/ci/role_separation_bootstrap.sql` — the script does role creation +
+cluster/schema-level grants ONLY. The DML-grant block (`GRANT SELECT, INSERT, UPDATE, DELETE ...`
++ `ALTER DEFAULT PRIVILEGES`) that previously lived inline in the script, and silently assumed the
+4 app tables already existed, is removed entirely — that behavior is already correctly supplied by
+migration `0007_grant_dml_role_privileges`, which grants once the tables actually exist, whether
+they got there via the Alembic chain from empty (greenfield) or already existed from a prior
+`create_all` (baseline-only cutover). No logic is duplicated between the two files; the script's
+own header comment now documents this explicitly, including the required run order
+(`provision_db_roles.sql` → `alembic upgrade head`, or `alembic stamp 0001_baseline_current_schema`
+first for a cutover of an already-`create_all`'d database).
+
+**Verification** — disposable local Postgres (`C:\Program Files\PostgreSQL\16\bin`, `initdb`/
+`pg_ctl`, ports 5490/5491 confirmed free of conflicts with other concurrent worktree activity
+before use, both clusters torn down + data dirs deleted after):
+
+- **Greenfield (empty DB, no tables) — PASS.** `provision_db_roles.sql` run against a brand-new
+  empty database, then `alembic upgrade head` end to end (0001 through 0008) as `fa_migrator`, zero
+  errors. Final privileges confirmed via `\dp` on all 4 tables: `fa_app=arwd` (SELECT/INSERT/
+  UPDATE/DELETE only, no DDL), `fa_migrator` full owner rights — exactly the intended split.
+- **Already-created (`create_all`'d) cutover — PASS, no regression for the documented scenario.**
+  `provision_db_roles.sql` itself still runs cleanly (no errors) against a database that already
+  has the 4 tables, same as before the fix. Following the documented cutover path
+  (`alembic stamp 0001_baseline_current_schema` then `alembic upgrade head`) through migration 0007
+  and confirming final privileges required a one-time `ALTER TABLE ... OWNER TO fa_migrator` on the
+  4 pre-existing tables first — see "new finding" below for why. With that done, migration 0007
+  applied cleanly and `\dp` showed identical final privileges to the greenfield case.
+
+**New finding, out of OBJ-011's scope, flagged for whoever eventually runs a real cutover**: a
+database whose tables were created by `Base.metadata.create_all` under a single pre-existing role
+(e.g. local `postgres` superuser) is NOT automatically owned by the newly-created `fa_migrator`
+role — `CREATE ROLE` doesn't transfer ownership of anything. Running the documented
+`alembic stamp` + `alembic upgrade head` cutover path as `fa_migrator` against such a database fails
+partway through with `psycopg2.errors.InsufficientPrivilege: must be owner of index
+ix_verifications_email` (migration 0002's `DROP INDEX`) — cleanly rolled back, `alembic_version`
+left at the prior stamp, no partial damage, but upgrade does not proceed until an operator runs
+something like `ALTER TABLE <table> OWNER TO fa_migrator` (or `REASSIGN OWNED BY <old_role> TO
+fa_migrator`, blocked here only because the old role was the cluster superuser `postgres`, which
+Postgres refuses to reassign away from since it also owns system objects) on the pre-existing
+tables first. This is unrelated to the DML-grant-block gap this pass fixed — it would occur
+regardless, for ANY cutover-to-role-separation of a pre-existing database, both before and after
+this fix — and is not something `provision_db_roles.sql` can address on its own (it doesn't know
+what role currently owns the tables). Not fixed here; flagging for the eventual real
+staging/production cutover runbook, same treatment the two devops-engineer findings above got.
+
+**Also hit and worked around during verification, unrelated to both the above**: migration 0006
+(`rate_limit_hit_ip_to_inet`)'s pre-DDL validation query (`ip !~ '^[0-9a-fA-F:.]+$'`) assumes
+`rate_limit_hits.ip` is still `character varying` at that point, but `app/models/rate_limit.py:36`
+already declares it `INET` (fixed since the devops-engineer finding #1 above was recorded — not
+re-verified further here, out of scope), so a freshly-`create_all`'d cutover database already has
+an `inet` column and the regex validation query fails with `operator does not exist: inet !~
+unknown`. Worked around for this verification by `alembic stamp 0006_rate_limit_hit_ip_inet`
+(schema already matches that migration's end state) before proceeding to 0007 — the actual target
+of this verification pass. Flagging, not fixing: this is migration 0006's own idempotency gap
+against an already-INET column, unrelated to role provisioning.
+
+Files changed: `docs/database/sql/provision_db_roles.sql` (header comment rewritten, DML-grant
+block removed). No changes to `alembic/versions/0007_grant_dml_role_privileges.py` or
+`scripts/ci/role_separation_bootstrap.sql` — both already correct, used as-is/as precedent.
+
+## CI unpinned from 0007 to head (2026-08-25, database-architect, OBJ-010 second step)
+
+Second step of OBJ-010, on branch `obj-010-refresh-rotation-reorder` (`f1758a5`/`00fe79e` already on
+it from `developer`'s handler-reorder fix, see the "FIXED" note above under the CRITICAL finding).
+With that fix landed, migration 0008 is no longer app-incompatible, so `.github/workflows/ci.yml`'s
+`test-alembic-schema-drift` job no longer has a reason to stop at 0007.
+
+**Change:** that job's `alembic upgrade 0007_grant_dml_role_privileges` step is now `alembic upgrade
+head` (job renamed from "pytest (alembic-provisioned schema, stops at 0007)" to "... (head)"). The
+stale "CRITICAL: never head" comment block above that step is replaced with a note pointing at this
+section. `role-separation-smoke-test` (a different job, testing grant behavior specifically at 0007)
+was deliberately left untouched — migration 0008 is an index, not a grant, so it has no bearing on
+that job's scope.
+
+**Independent re-verification** (database-architect, this pass, not reusing `developer`'s numbers
+uncritically): fresh throwaway Postgres 16 via `initdb`/`pg_ctl` (own data dir, port 5436, `trust`
+auth, torn down after), fresh per-worktree `.venv` built from this branch's `requirements-dev.lock.txt`
+(no `greenlet`/Application Control blocker on this run — `import greenlet` succeeded directly, and
+`initdb.exe` itself ran with no issue either):
+- `MIGRATOR_DATABASE_URL=postgresql+psycopg2://test:test@localhost:5436/api_fa_test alembic upgrade
+  head` — all 8 migrations applied cleanly in sequence (0001 through 0008), `fa_app`/`fa_migrator`
+  grants correctly no-op'd (no such roles in this throwaway DB, expected per §3). Confirmed via
+  `psql`: `alembic_version` = `0008_refresh_sess_partial_uniq`, and `\d refresh_sessions` shows
+  `ux_refresh_sessions_family_id_active` (`UNIQUE, btree (family_id) WHERE revoked_at IS NULL`)
+  present as expected.
+- `TEST_DATABASE_URL=postgresql+asyncpg://test:test@localhost:5436/api_fa_test
+  TEST_DB_SCHEMA_SOURCE=alembic pytest` against that same head-migrated schema — **281 passed**, 0
+  failed (matches `developer`'s own OBJ-010 count exactly: 279 pre-existing + the 2 new
+  `test_obj010_*` rotation tests).
+
+Migration 0008's own docstring and `tests/README.md`'s alembic-mode instructions both carried a
+"stop at 0007 / never head" warning predating this fix — both updated in this same pass with a
+short RESOLVED addendum pointing back here, rather than left stale for a future reader to
+rediscover or (worse) re-block on.
+
+No env vars beyond what CI already set were needed — `test-alembic-schema-drift` already exports
+`MIGRATOR_DATABASE_URL`/`TEST_DATABASE_URL` at the workflow-file `env:` level (matching
+`docker-compose.test.yml`'s port 5433), and `alembic/env.py`'s own placeholder-`Settings` block
+(§ "env.py design note" above, plus the `ENVIRONMENT` fix already recorded in this doc) already
+covers everything `Base`/model imports need without a real `.env`. Nothing new required.
+
+## OBJ-014 — rate_limit_hits index follow-up (2026-08-26, database-architect)
+
+**Summary:** Added migration `0009_rl_email_created_at_idx` — one new index,
+`ix_rate_limit_hits_scope_email_created_at_ip (scope, email, created_at, ip)` — to serve the
+email-only `COUNT` hot path in `enforce_rate_limit` (runs on every request to every one of the 6
+rate-limited endpoints), which the existing `ix_rate_limit_hits_scope_ip_email_created_at (scope,
+ip, email, created_at)` index does not serve well (cost ~1981, 365 buffer hits in the seeded test,
+vs. cost 4.45–8.45 / 3–5 buffer hits with the new index). **Deviated from
+`obj-014-design-notes.md` §4's suggested `(scope, email, ip, created_at)` column order** — empirically
+verified that ordering repeats the same structural flaw for this exact query (cost 237.50 / 147
+buffers on a heavy-history test, vs. 12.90 / 138 buffers for `(scope, email, created_at, ip)`), because
+`ip` still sits before `created_at`, breaking the range scan. The existing index is **left
+unchanged** — it already serves both the (unchanged) IP-only `COUNT` and the new OBJ-014 per-IP
+`EXISTS` check optimally as-is (verified: Postgres already picks it for the `EXISTS` query at cost
+4.45, because `scope`/`ip`/`email` are all pure-equality predicates there — order among equality
+columns doesn't matter to the planner). So this is two indexes serving two structurally different
+query shapes, not one widened index — see the migration's own docstring for the full reasoning and
+the specific EXPLAIN ANALYZE numbers this section summarizes.
+
+**Context:** `docs/api/obj-013-design-notes.md` §4 first flagged the (never-applied)
+`(scope, email, created_at)` recommendation to serve the email-only `COUNT`; `docs/api/
+obj-014-design-notes.md` §4 layered the new `EXISTS` check on top and suggested widening that
+still-unapplied recommendation to `(scope, email, ip, created_at)`. Both were design-only
+recommendations, not migrations — this pass is the first time either lands as an actual index.
+
+**Migration:** `alembic/versions/0009_rl_email_created_at_idx.py`
+(`revision = "0009_rl_email_created_at_idx"`, `down_revision =
+"0008_refresh_sess_partial_uniq"`). Pure `create_index`/`drop_index`, symmetric, no data risk.
+`app/models/rate_limit.py`'s `__table_args__` updated to declare the new `Index(...)` alongside the
+existing one, with an inline comment on each explaining which query shape it serves (model file is
+documentation here, not the schema source of truth — Alembic migrations are, per this doc's
+existing convention — but kept in sync since the effort is trivial).
+
+**Verification performed** (disposable Postgres 16, own `initdb`/`pg_ctl` data dir, port 5544,
+`trust` auth, torn down after; own per-worktree `.venv` built from `requirements.lock.txt` +
+`requirements-dev.lock.txt`):
+
+1. `MIGRATOR_DATABASE_URL=... alembic upgrade head` from a clean cluster — all 9 migrations
+   (0001–0009) applied cleanly in sequence.
+2. Seeded ~220k rows: ~200k background rows spread across 6 scopes/random emails/IPs over a 2-hour
+   window, plus a finding-#20-shaped attack (one victim email, one fixed attacker IP, 9 hits inside
+   a 55s window) and a separate heavy-history email (~20k rows across 200 distinct IPs over 2 hours,
+   mostly outside any 60s window) to stress-test the two candidate column orders realistically.
+3. `EXPLAIN (ANALYZE, BUFFERS, COSTS)` on all three query shapes `enforce_rate_limit` actually runs
+   (IP-only `COUNT`, email-only `COUNT`, the new per-IP `EXISTS`), before and after the migration,
+   and head-to-head between the two candidate index column orders on the heavy-history case
+   specifically (where the two orders' costs diverge most). Numbers are in the migration's own
+   docstring; headline: email-only `COUNT` went from cost ~1981 (365 buffers) to cost 4.45–8.45
+   (3–5 buffers) after the migration; the `EXISTS` check was already cheap (cost 4.45, 3–4 buffers)
+   both before and after, using the pre-existing index either way.
+4. `alembic downgrade -1` then `alembic upgrade head` again — confirmed clean symmetric
+   round-trip, new index dropped and recreated correctly.
+5. Postgres instance stopped (`pg_ctl stop -m fast`) after verification; no lasting environment
+   state left behind.
+
+**Not this pass's job / explicitly out of scope:** `app/core/rate_limit.py`'s actual banding logic
+(§3 of the OBJ-014 design doc) and the `RATE_LIMIT_EMAIL_RESERVED_SLOTS` config validator (§7) are
+`developer`'s implementation, on a separate branch — not touched here. The `distinct_ip_count_for_email`
+observability query (§2.7) is also `developer`'s call whether/how to implement; the new index's
+trailing `ip` column is deliberately kept (costs nothing for the email-only `COUNT`) so that query
+can use this same index as an index-only-scan source if `developer` adds it.

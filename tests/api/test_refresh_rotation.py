@@ -193,6 +193,135 @@ async def test_scenario_2_5_legacy_pre_obj002_refresh_token_rejected(
     assert second.status_code == 401
 
 
+async def test_obj010_multiple_sequential_rotations_do_not_violate_family_unique_constraint(
+    client, api_prefix, user_factory
+):
+    """OBJ-010 regression test (docs/database/obj-006-migration-plan.md
+    "CRITICAL finding: migration 0008 breaks the current /auth/refresh
+    handler"). The old insert-then-revoke ordering briefly had two rows
+    sharing `family_id` with `revoked_at IS NULL`, which migration 0008's
+    partial unique index (`ux_refresh_sessions_family_id_active`) forbids --
+    every single rotation raised a duplicate-key IntegrityError once that
+    migration was applied. Rotating five times in a row must keep succeeding
+    under the revoke-then-insert-then-link reorder (verified for real
+    against a database migrated through 0008 -- see the developer's Gate 3
+    report; also runs harmlessly against the default create_all schema,
+    which has no such constraint to violate).
+    """
+    user, password = await user_factory(email="rotate-multi-obj010@example.com")
+    token = (await _login(client, api_prefix, user.email, password))["refresh_token"]
+
+    for _ in range(5):
+        resp = await client.post(
+            f"{api_prefix}/auth/refresh", json={"refresh_token": token}
+        )
+        assert resp.status_code == 200, resp.text
+        token = resp.json()["refresh_token"]
+
+
+async def test_obj010_concurrently_revoked_session_fails_closed_on_refresh(
+    client, api_prefix, user_factory, db_session
+):
+    """OBJ-010 TOCTOU fix (obj-006-migration-plan.md section 5's
+    `/auth/refresh` bullet): the rotation UPDATE now repeats the
+    `WHERE revoked_at IS NULL` predicate atomically instead of relying on
+    the earlier SELECT alone. This simulates a concurrent request that
+    already revoked the same row between this request's SELECT and its
+    UPDATE -- the same sequential-simulation convention this project already
+    uses for TOCTOU-shaped scenarios (this file's own module docstring;
+    tests/README.md's Scenario 2.7 note) rather than true concurrency.
+    Expected: the atomic UPDATE affects 0 rows, and the request fails closed
+    (401) instead of silently overwriting `revoked_at` as if it had won the
+    race.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import update as sa_update
+
+    from app.models.refresh_session import RefreshSession
+
+    user, password = await user_factory(email="rotate-toctou-obj010@example.com")
+    token = (await _login(client, api_prefix, user.email, password))["refresh_token"]
+    jti = _decode(token)["jti"]
+
+    # Simulate a concurrent request that already revoked this exact row
+    # (e.g. its own rotation, or a reuse-detection sweep) before this
+    # request's UPDATE runs.
+    await db_session.execute(
+        sa_update(RefreshSession)
+        .where(RefreshSession.id == jti)
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{api_prefix}/auth/refresh", json={"refresh_token": token}
+    )
+
+    assert resp.status_code == 401
+    assert "access_token" not in resp.json()
+
+
+async def test_obj010_concurrent_rotation_401_carries_generic_no_oracle_detail(
+    client, api_prefix, user_factory, db_session
+):
+    """OBJ-010 Gate 3 addition (qa-engineer). The developer's own
+    `test_obj010_concurrently_revoked_session_fails_closed_on_refresh` (above)
+    only asserts status_code == 401 and that `access_token` is absent -- it
+    does not confirm the response BODY. `auth.py`'s `refresh_token` handler
+    raises the exact same `invalid_token_exception` object (detail="Invalid
+    or expired refresh token") on every one of its five rejection branches
+    -- no_session, reuse, expired, ver_mismatch, AND concurrent_rotation --
+    by deliberate design (the handler's own docstring: "no oracle over which
+    specific case... was hit"). This test closes that verification gap: it
+    proves the concurrent_rotation branch's client-visible detail is
+    byte-for-byte identical to the plain no_session case, i.e. a client
+    (or an attacker probing the endpoint) cannot distinguish "this session
+    was already revoked by a racing request" from "this jti never existed"
+    just by reading the response body. The internal reason IS distinguishable
+    server-side only, via the `reason="concurrent_rotation"` structured audit
+    log field (not asserted here -- audit_log call arguments are not
+    HTTP-observable and this test is a contract test).
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import update as sa_update
+
+    from app.models.refresh_session import RefreshSession
+
+    user, password = await user_factory(email="rotate-toctou-detail@example.com")
+    token = (await _login(client, api_prefix, user.email, password))["refresh_token"]
+    jti = _decode(token)["jti"]
+
+    await db_session.execute(
+        sa_update(RefreshSession)
+        .where(RefreshSession.id == jti)
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+    await db_session.commit()
+
+    concurrent_rotation_resp = await client.post(
+        f"{api_prefix}/auth/refresh", json={"refresh_token": token}
+    )
+
+    no_session_resp = await client.post(
+        f"{api_prefix}/auth/refresh", json={"refresh_token": "not-a-real-token"}
+    )
+
+    assert concurrent_rotation_resp.status_code == 401 == no_session_resp.status_code
+    assert (
+        concurrent_rotation_resp.json()["detail"]
+        == no_session_resp.json()["detail"]
+        == "Invalid or expired refresh token"
+    ), (
+        "the concurrent_rotation rejection must be byte-for-byte "
+        "indistinguishable from an ordinary no-matching-session 401 -- a "
+        "differing detail string here would be a new oracle leaking "
+        "internal race-detection state to the client, defeating the "
+        "handler's own no-oracle design guarantee"
+    )
+
+
 async def test_expired_refresh_session_returns_401(client, api_prefix, user_factory):
     """design notes section 2, branch 3: an ordinary time-expired session
     row (never revoked) is a plain 401 -- largely redundant with the JWT's

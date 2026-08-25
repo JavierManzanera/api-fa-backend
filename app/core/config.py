@@ -1,4 +1,4 @@
-from typing import Annotated, List, Union
+from typing import Annotated, List, Optional, Union
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import AnyHttpUrl, PostgresDsn, computed_field, field_validator, model_validator
 from functools import lru_cache
@@ -52,6 +52,22 @@ class Settings(BaseSettings):
     # convention -- every environment must say what it wants.
     POSTGRES_SSL_MODE: str
 
+    # Security audit finding #18 (docs/security/audit-report.md, OBJ-012
+    # Gate 3 section; full investigation:
+    # docs/database/obj-012-tls-dast-verification.md, Finding 1): optional
+    # path to a CA certificate file to trust for POSTGRES_SSL_MODE=
+    # verify-full, IN ADDITION TO (not instead of) the OS default trust
+    # store. Optional, defaulting to None -- unlike POSTGRES_SSL_MODE, this
+    # is not a "every environment must say what it wants" field: leaving it
+    # unset preserves today's existing verify-full behavior (OS trust store
+    # only) for every deployment that already works against a
+    # publicly-trusted CA. Set this to pin a private/self-signed CA for a
+    # self-hosted Postgres instance -- without it, verify-full fails closed
+    # against any cert the OS doesn't already trust, which was pushing
+    # self-hosted/private-CA operators toward the weaker, MITM-vulnerable
+    # 'require' mode instead.
+    POSTGRES_SSL_ROOT_CERT: Optional[str] = None
+
     SECRET_KEY: str
     ALGORITHM: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int
@@ -91,6 +107,27 @@ class Settings(BaseSettings):
     # X-Forwarded-For at all -- the maximally safe default, and exactly
     # today's existing (unconfigured) behavior.
     TRUSTED_PROXY_COUNT: int = 0
+
+    # OBJ-013 (obj-013-design-notes.md section 2/3): multiplier applied to a
+    # scope's email-keyed `limit` to derive the default IP-keyed threshold
+    # when a call site doesn't override it via `ip_limit`. Deliberately more
+    # generous than the email-keyed limit -- shared/NAT'd/corporate-proxy
+    # IPs are normal legitimate traffic; see design notes section 2 for why
+    # this exact value needs user sign-off before changing. Safe default
+    # (misconfiguration only affects rate-limit generosity, not security
+    # posture), same convention as TRUSTED_PROXY_COUNT/LOG_LEVEL above.
+    RATE_LIMIT_IP_MULTIPLIER: int = 5
+
+    # OBJ-014 (obj-014-design-notes.md section 2/3): size of the reserved
+    # "fresh IP only" slot pool carved out of the tail end of each scope's
+    # existing email-keyed `limit` -- NOT an additional budget on top of
+    # `limit`, a restriction on who may spend the last `reserved` units of the
+    # existing one. Closes audit finding #20 (a single attacking IP could
+    # otherwise exhaust a victim's whole email-keyed budget alone). Default 1
+    # is deliberately small -- see design notes section 6 for why this exact
+    # value needs user sign-off before changing, same posture as
+    # RATE_LIMIT_IP_MULTIPLIER.
+    RATE_LIMIT_EMAIL_RESERVED_SLOTS: int = 1
 
     # OBJ-005 (obj-005-design-notes.md section 4.5): which EmailSender
     # implementation app.api.deps.get_email_sender() wires up. Safe default
@@ -171,6 +208,44 @@ class Settings(BaseSettings):
                 "supported by this template's validated configuration surface "
                 "-- see audit-report.md finding #15 / OBJ-008 before enabling "
                 "one."
+            )
+        return value
+
+    # Security audit finding #21 (docs/security/audit-report.md, "Gate 3 --
+    # Verificacion OBJ-013" section 3b): a 0 or negative multiplier makes
+    # `resolved_ip_limit` (rate_limit.py) 0 or negative, and a COUNT() result is
+    # never negative -- `ip_hits.scalar_one() >= resolved_ip_limit` becomes
+    # unconditionally true, self-denying the FIRST request from ANY IP on ALL 6
+    # rate-limited endpoints. Not attacker-reachable (this is a deploy-time
+    # setting, not request input) but a cheap fail-closed guardrail, same
+    # posture as every other validated field in this class.
+    @field_validator("RATE_LIMIT_IP_MULTIPLIER")
+    @classmethod
+    def validate_rate_limit_ip_multiplier(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(
+                f"RATE_LIMIT_IP_MULTIPLIER must be >= 1, got {value!r}. A value "
+                "of 0 or negative makes the IP-keyed rate limit unreachable "
+                "(0) or nonsensical (negative), which self-denies every request "
+                "on all 6 rate-limited endpoints -- see audit-report.md finding #21."
+            )
+        return value
+
+    # OBJ-014 (obj-014-design-notes.md section 7): proactive validator for
+    # the new RATE_LIMIT_EMAIL_RESERVED_SLOTS setting, same fail-closed
+    # posture as RATE_LIMIT_IP_MULTIPLIER above -- added alongside it so it
+    # doesn't become a future finding of the same shape. 0 is a legitimate,
+    # explicit opt-out (disables the reserved-fresh-IP-slot mitigation,
+    # design notes section 6); negative has no defined meaning.
+    @field_validator("RATE_LIMIT_EMAIL_RESERVED_SLOTS")
+    @classmethod
+    def validate_rate_limit_email_reserved_slots(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(
+                f"RATE_LIMIT_EMAIL_RESERVED_SLOTS must be >= 0, got {value!r}. "
+                "0 explicitly disables the reserved-fresh-IP-slot mitigation "
+                "(obj-014-design-notes.md section 2/6) and is allowed; a "
+                "negative value has no defined meaning."
             )
         return value
 

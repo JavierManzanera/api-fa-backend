@@ -29,6 +29,23 @@ FORGOT_PASSWORD_LIMIT = 5
 VERIFY_OTP_LIMIT = 10
 RESET_PASSWORD_LIMIT = 10
 
+# OBJ-014 (obj-014-design-notes.md sections 2/3/6, finding #20 mitigation):
+# the last RATE_LIMIT_EMAIL_RESERVED_SLOTS (default 1) of each scope's
+# email-keyed limit are now reserved for an IP that has NOT yet been
+# recorded against that email in the current window. A single, never-
+# rotated IP/email pair (exactly this test's shape -- the shared `client`
+# fixture uses one real IP for every request) can therefore only ever claim
+# the MAIN POOL (limit - reserved), because by the time the tally reaches
+# the reserved band its own IP has already been recorded and is
+# ineligible. This is the documented, accepted trade-off of the fix (design
+# notes section 6): a lone non-rotating actor is capped one request lower
+# than before, in exchange for guaranteeing a genuinely different IP
+# (the real victim's) at least one request through even after a single
+# attacking IP has exhausted the rest of the budget. Still strictly <=
+# the pre-OBJ-014 ceiling, never more -- the protection is not weakened.
+RESERVED_SLOTS_DEFAULT = 1
+FORGOT_PASSWORD_MAIN_POOL_LIMIT = FORGOT_PASSWORD_LIMIT - RESERVED_SLOTS_DEFAULT
+
 
 async def test_forgot_password_rate_limited_after_5_requests_per_ip_email(
     client, api_prefix, user_factory
@@ -42,9 +59,13 @@ async def test_forgot_password_rate_limited_after_5_requests_per_ip_email(
         )
         statuses.append(resp.status_code)
 
-    assert statuses[:FORGOT_PASSWORD_LIMIT] == [200] * FORGOT_PASSWORD_LIMIT
-    assert statuses[FORGOT_PASSWORD_LIMIT] == 429, (
-        f"the {FORGOT_PASSWORD_LIMIT + 1}th request within the window must be rate-limited"
+    # OBJ-014: a single, never-rotated IP is capped at the main pool
+    # (limit - reserved), not the full limit -- see the module-level
+    # comment above FORGOT_PASSWORD_MAIN_POOL_LIMIT.
+    assert statuses[:FORGOT_PASSWORD_MAIN_POOL_LIMIT] == [200] * FORGOT_PASSWORD_MAIN_POOL_LIMIT
+    assert all(status == 429 for status in statuses[FORGOT_PASSWORD_MAIN_POOL_LIMIT:]), (
+        f"requests from the {FORGOT_PASSWORD_MAIN_POOL_LIMIT + 1}th onward, "
+        f"from the SAME never-rotated IP, must be rate-limited -- got {statuses}"
     )
 
 

@@ -22,12 +22,36 @@ class RateLimitHit(Base):
 
     __tablename__ = "rate_limit_hits"
     __table_args__ = (
+        # Serves the IP-only COUNT (scope, ip equality prefix + created_at
+        # range) and, empirically (see migration 0009's docstring), the
+        # OBJ-014 per-IP EXISTS check too (scope/ip/email are all equality
+        # predicates there, so column order among them doesn't matter to
+        # the planner) -- added in migration 0001.
         Index(
             "ix_rate_limit_hits_scope_ip_email_created_at",
             "scope",
             "ip",
             "email",
             "created_at",
+        ),
+        # Serves the email-only COUNT (scope, email equality prefix +
+        # created_at range, no ip predicate) -- the hot path that runs on
+        # every request to every rate-limited endpoint. NOT served by the
+        # index above: `ip` sits between the equality columns and
+        # `created_at` there, which breaks the range scan. `ip` is kept as
+        # a trailing covering column here (not needed for this query, but
+        # free, and usable for a future COUNT(DISTINCT ip) observability
+        # query -- obj-014-design-notes.md section 2.7). Added in migration
+        # 0009 -- see that migration's docstring and
+        # docs/database/obj-006-migration-plan.md (OBJ-014 section) for the
+        # full EXPLAIN ANALYZE comparison against the alternative column
+        # order.
+        Index(
+            "ix_rate_limit_hits_scope_email_created_at_ip",
+            "scope",
+            "email",
+            "created_at",
+            "ip",
         ),
     )
 

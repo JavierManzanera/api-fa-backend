@@ -795,16 +795,53 @@ async def refresh_token(
         raise invalid_token_exception
 
     new_jti = uuid.uuid4()
+
+    # OBJ-010 (docs/database/obj-006-migration-plan.md "CRITICAL finding" +
+    # section 5): revoke the OLD row first, atomically, before inserting its
+    # replacement -- revoke -> insert -> link, not insert -> revoke. Two
+    # problems fixed by this single reorder, both on this same code path:
+    #
+    #   1. Migration 0008 adds a partial unique index on
+    #      refresh_sessions(family_id) WHERE revoked_at IS NULL. The old
+    #      insert-then-revoke order briefly had TWO active rows in the same
+    #      family visible within the transaction, which that index forbids --
+    #      every rotation raised a duplicate-key IntegrityError once 0008
+    #      was applied. Revoking first means at most one active row per
+    #      family ever exists.
+    #   2. The `WHERE revoked_at IS NULL` predicate is repeated on this
+    #      UPDATE (not just relied on from the SELECT above), making it an
+    #      atomic compare-and-set instead of a blind write. If a concurrent
+    #      request already revoked this exact row (its own rotation, or a
+    #      reuse-detection sweep on the family) between our SELECT and this
+    #      UPDATE, rowcount is 0 and we fail closed -- rejecting this refresh
+    #      -- instead of silently overwriting revoked_at as if we'd won the
+    #      race. Closes the TOCTOU gap flagged in the same design-doc
+    #      section.
+    revoke_result = await db.execute(
+        update(RefreshSession)
+        .where(RefreshSession.id == jti, RefreshSession.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    if revoke_result.rowcount != 1:
+        await db.rollback()
+        audit_log.log_auth_event(
+            "auth.refresh.failure", ip=ip, reason="concurrent_rotation"
+        )
+        raise invalid_token_exception
+
     tokens = await _issue_tokens_and_session(
         db, user, family_id=session_row.family_id, jti=new_jti
     )
     # Flush the INSERT of the new row before pointing the old row's
-    # replaced_by FK at it -- otherwise SQLAlchemy may order the old row's
-    # UPDATE before the new row's INSERT within the same flush, violating
-    # the FK constraint.
+    # replaced_by FK at it -- the FK still requires the new row to exist
+    # first, so this remains a 3-statement sequence (revoke, insert, link)
+    # rather than 2.
     await db.flush()
-    session_row.revoked_at = now
-    session_row.replaced_by = new_jti
+    await db.execute(
+        update(RefreshSession)
+        .where(RefreshSession.id == jti)
+        .values(replaced_by=new_jti)
+    )
     await db.commit()
     audit_log.log_auth_event(
         "auth.refresh.success",

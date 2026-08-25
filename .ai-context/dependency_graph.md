@@ -40,7 +40,7 @@ PASS, PR #5 merged).
 its suppressed CVE) from the tree entirely. CLOSED 2026-08-25 (Gate 3 unanimous PASS, PR #7 merged).
 
 [OBJ-009] Rate limiting on /register (finding #16) — closes the DoS amplification gap OBJ-007's
-own timing-parity fix introduced. CLOSED 2026-08-25 (Gate 3 unanimous PASS, PR pending).
+own timing-parity fix introduced. CLOSED 2026-08-25 (Gate 3 unanimous PASS, PR #10 merged).
 
 [OBJ-010] Migration 0008 safe-deploy: reorder /auth/refresh rotation handler + TOCTOU fix on that
 same code path. In progress 2026-08-25.
@@ -69,11 +69,12 @@ In progress 2026-08-25.
 | OBJ-007 | `/register` switches to generic anti-enumeration response (matches `/forgot-password`) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (PR #5 merged) | audit-report.md #6 |
 | — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | **CLOSED** (PR #4 merged) | audit-report.md #15 |
 | OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | **CLOSED** (PR #7 merged `d6d5771`) | audit-report.md #15 |
-| OBJ-009 | Rate limiting on `/register` (finding #16, DoS amplification) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (Gate 3 unanimous PASS, PR pending) | audit-report.md §Gate 3 OBJ-007 |
-| OBJ-010 | Reorder `/auth/refresh` rotation handler (revoke→insert→link) so migration 0008 is safe; combined TOCTOU atomic-UPDATE fix on the same code | developer → database-architect (apply 0008, unpin CI) → qa-engineer ∥ security-specialist | Dispatched | obj-006-migration-plan.md "CRITICAL finding" + §5 |
-| OBJ-011 | `provision_db_roles.sql` DML-grant block assumes tables exist — fails on a genuine greenfield deploy | database-architect | Dispatched | obj-006-migration-plan.md "devops-engineer pass" #2 |
-| OBJ-012 | Real TLS-terminated-Postgres DAST check (sandbox never had certs to verify `require`/`verify-full` against) | devops-engineer → security-specialist | Dispatched | obj-003-design-notes.md residual note |
-| OBJ-013 | Harden `enforce_rate_limit` keying (finding #17): AND-combined `(scope,ip,email)` is trivially resettable by rotating either field | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | Dispatched | audit-report.md §Gate 3 OBJ-009 (finding #17) |
+| OBJ-009 | Rate limiting on `/register` (finding #16, DoS amplification) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (PR #10 merged `0d526ea`) | audit-report.md §Gate 3 OBJ-007 |
+| OBJ-010 | Reorder `/auth/refresh` rotation handler (revoke→insert→link) so migration 0008 is safe; combined TOCTOU atomic-UPDATE fix on the same code | developer → database-architect → qa-engineer ∥ security-specialist | **Gate 3 PASS both**, all merged into integration branch `obj-010-013-residual-hardening` (`ed08ec4`) | obj-006-migration-plan.md "CRITICAL finding"+§5; tests=docs/testing/obj-010-test-report.md; security=audit-report.md §"Gate 3 — Verificación OBJ-010" |
+| OBJ-011 | `provision_db_roles.sql` DML-grant block assumes tables exist — fails on a genuine greenfield deploy | database-architect | **Done** (`21dcbe4`, both scenarios verified), merged into integration branch | obj-006-migration-plan.md "devops-engineer pass" #2 |
+| OBJ-012 | Real TLS-terminated-Postgres DAST check; surfaced finding #18 (no private-CA pinning), fixed same objective | devops-engineer → security-specialist; fix: developer → security-specialist | **Done.** Finding #18 **CERRADO**. LOW finding #19 raised (doc-wording only) — not actioned, low priority | obj-003-design-notes.md; security=audit-report.md finding #18/#19 |
+| OBJ-013 | Harden `enforce_rate_limit` keying (finding #17) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **Gate 3 PASS both**, finding #17 **CERRADO**. Fix surfaced findings #20/#21, see OBJ-014 | audit-report.md §Gate 3 OBJ-009/OBJ-013; tests=docs/testing/obj-013-test-report.md |
+| OBJ-014 | Mitigate finding #20 (DoS from OBJ-013's ip/email decoupling) + finding #21 (missing validator) | solution-architect → developer ∥ database-architect (index) → qa-engineer ∥ security-specialist | **CLOSED.** Gate 3 PASS both, findings #20/#21 **CERRADO**. All 5 objectives (OBJ-010..014) now fully merged into integration branch `obj-010-013-residual-hardening` (`ed08ec4`), full suite 325/325 — ready for the single consolidated PR to `main` | audit-report.md §Gate 3 OBJ-014; design=docs/api/obj-014-design-notes.md; tests=docs/testing/obj-014-test-report.md |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
 
@@ -225,6 +226,19 @@ to ignore).
   CI status checks, `enforce_admins: true`.
 
 ## Notes
+
+- **2026-08-25, integration-branch convention for closely-spaced parallel objectives:** running
+  OBJ-010..013 in parallel (each on its own branch, per-objective) repeatedly hit the same problem —
+  a later branch cut from `main` before an earlier related PR had merged went stale, needing a
+  merge-in of `main` before its own PR could go green (re-triggering CI), and objectives sharing an
+  owned doc's header/index block (`dependency_graph.md`, `audit-report.md`) or the same code file
+  (OBJ-010 and OBJ-009 both touch `auth.py`) could conflict with each other too, not just with
+  `main`. User-requested fix: for a batch of closely-spaced objectives like this, merge each
+  objective branch into one shared integration branch (`obj-010-013-residual-hardening`) as it
+  finishes, resolve any conflict once there instead of N times against `main`, then open a single PR
+  for the whole batch. Doesn't replace the normal one-objective-one-PR pattern for objectives spaced
+  further apart in time — this is specifically for a wave of parallel work opened together.
+
 
 - OBJ-001 is the priority tranche: findings #1+#2 chain into an unauthenticated full
   account-takeover (enumerate email → brute-force OTP → reset password → stolen refresh token from

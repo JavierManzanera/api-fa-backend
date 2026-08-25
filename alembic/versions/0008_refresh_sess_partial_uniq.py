@@ -64,6 +64,19 @@ developer pass.
 
 Risk: Low as pure DDL; HIGH as an app-compatibility hazard for the reason
 above. Reversible.
+
+*** RESOLVED (2026-08-25, OBJ-010) ***
+`developer` reordered `/auth/refresh`'s rotation handler to
+revoke->insert->link in commit f1758a5 -- see
+docs/database/obj-006-migration-plan.md's "FIXED" note under this same
+CRITICAL finding for the reproduction/fix detail. `database-architect`
+re-verified independently (OBJ-010, same date): fresh `alembic upgrade
+head` applies cleanly and the full test suite passes (281 passed) against
+a head-migrated schema. CI's schema-drift job is unpinned from 0007 to
+head accordingly (`.github/workflows/ci.yml`). This migration is now safe
+to deploy anywhere running the current rotation handler; the warning above
+is left in place as the historical record of why it was blocked, not as a
+live restriction.
 """
 from typing import Sequence, Union
 
