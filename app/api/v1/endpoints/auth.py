@@ -32,6 +32,13 @@ OTP_RESEND_COOLDOWN_SECONDS = 60
 FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE = 5
 VERIFY_OTP_RATE_LIMIT_PER_MINUTE = 10
 RESET_PASSWORD_RATE_LIMIT_PER_MINUTE = 10
+# OBJ-009 (obj-009-design-notes.md section 1, closes audit finding #16):
+# /register sends exactly one outbound email on EVERY call, on BOTH
+# branches (see GENERIC_REGISTRATION_MESSAGE below) -- same "triggers an
+# email send" category as FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE and
+# RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE, so it gets the same tighter
+# 5/min limit rather than the 10/min OTP-check group's headroom.
+REGISTER_RATE_LIMIT_PER_MINUTE = 5
 # Named constant, extracted from the inline `timedelta(minutes=10)` literal
 # that used to sit directly at the /forgot-password call site (design notes
 # section 1.2's flagged, non-blocking cleanup) -- makes both purposes' TTLs
@@ -242,8 +249,28 @@ async def register(
     symmetrically with the new-account branch. Audit logging is exempt
     from this parity requirement (design notes section 2): outcome still
     distinguishes success/duplicate internally.
+
+    OBJ-009 (obj-009-design-notes.md section 2, closes audit finding #16):
+    `enforce_rate_limit` is called exactly ONCE, here, before the
+    new-vs-duplicate-email branch decision even happens -- never
+    duplicated per-branch, never keyed by a branch-specific scope. This is
+    the load-bearing placement: OBJ-007's entire deliverable was making
+    the two branches indistinguishable from the outside, so throttling
+    them asymmetrically (or independently) would reopen finding #6 as a
+    NEW timing/observability side channel. A single shared call site, one
+    scope, before either branch has any information that could differ,
+    makes that class of bug structurally unreachable rather than merely
+    untested.
     """
     ip = rate_limit.client_ip(http_request)
+    await rate_limit.enforce_rate_limit(
+        db,
+        scope="register",
+        ip=ip,
+        email=user_in.email,
+        limit=REGISTER_RATE_LIMIT_PER_MINUTE,
+    )
+
     result = await db.execute(select(User).filter(User.email == user_in.email))
     user = result.scalars().first()
 

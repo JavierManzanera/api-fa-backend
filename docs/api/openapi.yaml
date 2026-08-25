@@ -24,7 +24,12 @@ info:
     `POST /auth/register` no longer returns a distinguishable `400` for an
     already-registered email — it now always returns the same generic `200`/
     `MessageResponse` shape used by `/auth/forgot-password` and
-    `/auth/resend-verification-email`, closes audit finding #6). Config/startup-only
+    `/auth/resend-verification-email`, closes audit finding #6), plus the OBJ-009
+    remediation surface (`POST /auth/register` now enforces the same IP+email
+    rate limiting — `429` — as `/auth/forgot-password`, `/auth/verify-otp`,
+    `/auth/resend-verification-email`, and `/auth/reset-password`, closing audit
+    finding #16: the CPU-exhaustion DoS amplification created by OBJ-007's own
+    unconditional bcrypt-hash-on-duplicate-branch fix). Config/startup-only
     or transport-layer requirements that have no HTTP surface (SECRET_KEY
     validation, PostgreSQL TLS enforcement, CORS/security-headers middleware,
     environment gating, audit logging, `EmailSender` provider selection, and —
@@ -33,7 +38,8 @@ info:
     intentionally NOT modeled here — see `docs/api/obj-001-design-
     notes.md` §4, `docs/api/obj-003-design-notes.md` §2, `docs/api/obj-004-design-
     notes.md` (full document), `docs/api/obj-005-design-notes.md` (full document),
-    and `docs/api/obj-007-design-notes.md` (full document).
+    `docs/api/obj-007-design-notes.md` (full document), and
+    `docs/api/obj-009-design-notes.md` (full document).
     Session/token persistence design (the `refresh_sessions` table, reuse-detection
     state machine, `token_version` claim) is documented in
     `docs/api/obj-002-design-notes.md`. **Note on finding numbers:** `obj-003-design-
@@ -45,7 +51,7 @@ info:
     independently verified against `audit-report.md` and found correct, no transposition
     (`obj-004-design-notes.md` §0). OBJ-005's #11 citation was independently verified
     against `audit-report.md` and found correct (`obj-005-design-notes.md` §0).
-  version: "0.7.0-obj-007"
+  version: "0.9.0-obj-009"
   contact:
     name: solution-architect (PRJ-003)
 servers:
@@ -108,6 +114,16 @@ paths:
         entire registration is rolled back (no `User`/`Verification` row survives).
         Existing-account branch: nothing to roll back (no rows were ever created).
         See `obj-007-design-notes.md` §3.
+
+        **Rate limiting (OBJ-009, closes audit finding #16).** IP+email rate
+        limiting (`429`) is now enforced, same mechanism as `/auth/forgot-password`
+        and `/auth/resend-verification-email` — see `RateLimited`. The check runs
+        **before** the new-vs-duplicate-email branch decision, on the single
+        request-scoped code path both branches share, so a client is throttled
+        identically regardless of which branch would have fired — rate limiting
+        must never itself become a branch-distinguishing side channel (that would
+        undermine OBJ-007's anti-enumeration guarantee). See
+        `obj-009-design-notes.md` §2 for why this matters and where the call sits.
       requestBody:
         required: true
         content:
@@ -128,6 +144,8 @@ paths:
                 msg: "If this email is not already registered, we've sent you a verification code to complete your registration."
         '422':
           $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
         '503':
           description: >-
             A required outbound email (the new-account verification code, or the
