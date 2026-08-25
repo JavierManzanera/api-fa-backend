@@ -145,27 +145,25 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.test.yml down -v
 
-  # --- Advisory gate: schema via real Alembic migrations (0001..0007) ---
+  # --- Required gate: schema via real Alembic migrations (0001..0007) ---
   # Proves the migrations in alembic/versions/ produce a schema the
   # existing test suite actually accepts, not just that `alembic upgrade`
   # runs without erroring -- the only real regression check against
   # ORM/migration drift (obj-006-migration-plan.md handoff section).
   #
-  # continue-on-error: true -- KNOWN FAILING as of 2026-08-25 (verified
-  # locally, not assumed): migration 0006 (rate_limit_hit_ip_to_inet)
-  # changes `rate_limit_hits.ip` to native Postgres INET, but
-  # app/models/rate_limit.py:36 still declares it `Mapped[str] =
-  # mapped_column(String, ...)`. Every rate-limit-gated endpoint request
-  # then fails with "operator does not exist: inet = character varying"
-  # (asyncpg UndefinedFunctionError) -- confirmed as the SINGLE root cause
-  # behind all ~60 failures this job produces (every other test passes).
-  # This is a model/migration drift bug for `developer`/`database-architect`
-  # to fix (RateLimitHit.ip needs sqlalchemy.dialects.postgresql.INET, or
-  # an explicit cast in the rate-limit query) -- out of devops-engineer
-  # scope to fix here. Kept non-blocking so this real, separate bug doesn't
-  # block unrelated merges, but still runs on every PR so its own log stays
-  # the up-to-date, visible record of the drift until it's fixed -- flip
-  # continue-on-error back to false (or remove it) once that lands.
+  # Was `continue-on-error: true` (advisory) from 2026-08-25 through this
+  # same day's later fix: migration 0006 (rate_limit_hit_ip_to_inet) had
+  # changed `rate_limit_hits.ip` to native Postgres INET while
+  # app/models/rate_limit.py:36 still declared it `Mapped[str] =
+  # mapped_column(String, ...)`, causing ~60 failures ("operator does not
+  # exist: inet = character varying", asyncpg UndefinedFunctionError).
+  # Fixed in commit bae2915 (RateLimitHit.ip now uses
+  # sqlalchemy.dialects.postgresql.INET). Re-verified locally
+  # (devops-engineer, 2026-08-25) against a throwaway initdb/pg_ctl
+  # Postgres 16 on port 5433: `alembic upgrade
+  # 0007_grant_dml_role_privileges` then `TEST_DB_SCHEMA_SOURCE=alembic
+  # pytest` -- 255 passed, 0 failed. `continue-on-error` removed; this is
+  # now a required, blocking gate like the others.
   #
   # CRITICAL: stops at 0007_grant_dml_role_privileges, NEVER `head` / 0008.
   # Migration 0008 (refresh_sess_partial_uniq) is confirmed to
@@ -174,10 +172,9 @@ jobs:
   # this target until a developer pass reorders that handler and the
   # migration-plan doc is updated to say 0008 is safe.
   test-alembic-schema-drift:
-    name: "pytest (alembic-provisioned schema, stops at 0007 -- advisory)"
+    name: "pytest (alembic-provisioned schema, stops at 0007)"
     needs: dependency-audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
