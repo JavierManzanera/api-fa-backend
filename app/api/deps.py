@@ -2,7 +2,8 @@ from functools import lru_cache
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from jose import jwt, JWTError
+import jwt
+from jwt import PyJWTError
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -35,7 +36,7 @@ async def get_current_user(
         if email is None:
             raise credentials_exception
         token_data = TokenData(email=email)
-    except (JWTError, ValidationError):
+    except (PyJWTError, ValidationError):
         raise credentials_exception
 
     result = await db.execute(select(User).filter(User.email == token_data.email))

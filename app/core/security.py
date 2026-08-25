@@ -4,7 +4,8 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any, Union
-from jose import jwt, JWTError
+import jwt
+from jwt import PyJWTError
 from fastapi import HTTPException, status
 from passlib.context import CryptContext
 from app.core.config import settings
@@ -143,7 +144,7 @@ def _decode_refresh_payload(token: str) -> dict:
         if payload.get("sub") is None:
             raise credentials_exception
         return payload
-    except JWTError:
+    except PyJWTError:
         raise credentials_exception
 
 
@@ -174,6 +175,6 @@ def extract_jti_if_present(token: str) -> Optional[str]:
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
+    except PyJWTError:
         return None
     return payload.get("jti")

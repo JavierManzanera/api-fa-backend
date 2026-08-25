@@ -30,6 +30,10 @@ htmlcov/
 # Disposable local test Postgres (initdb/pg_ctl pattern, no Docker on this machine)
 .pgdata-test*/
 
+# Agent-tool worktree-isolation scratch space (not .claude/agents/ -- that lives at the workspace
+# root, not per-project)
+.claude/worktrees/
+
 # Alembic
 alembic/versions/*.pyc
 

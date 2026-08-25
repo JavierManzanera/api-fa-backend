@@ -23,7 +23,14 @@ pydantic-settings==2.15.0
 email-validator==2.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==3.2.2
-python-jose[cryptography]==3.5.0
+# OBJ-008 (audit-report.md finding #15): replaces python-jose[cryptography]
+# -- PyJWT never depends on `ecdsa` at all (python-jose did, transitively,
+# which is what PYSEC-2026-1325 lived in), removing that advisory from the
+# dependency tree entirely instead of relying on ALGORITHM's fail-closed
+# validator alone. NOTE: PyJWT's actual PyPI extra is named `crypto`, not
+# `cryptography` -- `pip install "PyJWT[cryptography]"` installs PyJWT with
+# a no-op/unknown-extra warning, silently skipping the cryptography backend.
+PyJWT[crypto]==2.13.0
 python-multipart==0.0.32
 
 # OBJ-006 (devops-engineer, obj-006-migration-plan.md section 4): scheduled
