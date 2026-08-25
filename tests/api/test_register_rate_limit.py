@@ -43,7 +43,11 @@ Requires Postgres -- see tests/README.md / tests/conftest.py module
 docstring.
 """
 
+import inspect
+
 from freezegun import freeze_time
+
+from app.api.v1.endpoints import auth as auth_module
 
 REGISTER_RATE_LIMIT_PER_MINUTE = 5
 VALID_PASSWORD = "ValidPass123!"
@@ -227,3 +231,43 @@ class TestRateLimitDoesNotReopenEnumeration:
             new_email_429.headers.get("retry-after")
             == dup_email_429.headers.get("retry-after")
         ), "the Retry-After value itself must not differ between branches"
+
+
+# ----------------------------------------------------------------------------
+# QA Gate 3 addition (2026-08-25): structural guard for a blind spot the
+# behavioral tests above cannot cover. If a future edit split
+# enforce_rate_limit into TWO call sites -- one inside
+# _handle_new_email_registration, one inside _handle_duplicate_email_registration
+# -- using the SAME scope="register" and the SAME limit on both, every
+# behavioral test above would still pass: only one branch executes per
+# request, so identical scope+limit produces identical observed 200/429
+# sequences and identical response bodies. Design notes section 4 point 1
+# forbids this anyway ("two call sites, even with identical arguments
+# today, is a maintenance hazard") precisely because nothing observable
+# would catch the drift the day someone edits only one of the two call
+# sites. This test asserts the call site by source inspection instead of
+# by behavior, so that class of regression fails loudly here.
+# ----------------------------------------------------------------------------
+
+
+def test_register_rate_limit_call_site_is_singular_and_shared():
+    register_src = inspect.getsource(auth_module.register)
+    new_email_src = inspect.getsource(auth_module._handle_new_email_registration)
+    dup_email_src = inspect.getsource(auth_module._handle_duplicate_email_registration)
+
+    assert register_src.count("enforce_rate_limit(") == 1, (
+        "register() itself must contain exactly one enforce_rate_limit call "
+        f"-- found {register_src.count('enforce_rate_limit(')}"
+    )
+    assert new_email_src.count("enforce_rate_limit(") == 0, (
+        "_handle_new_email_registration must NOT call enforce_rate_limit -- "
+        "the check belongs solely in the shared register() handler"
+    )
+    assert dup_email_src.count("enforce_rate_limit(") == 0, (
+        "_handle_duplicate_email_registration must NOT call enforce_rate_limit "
+        "-- the check belongs solely in the shared register() handler"
+    )
+    assert 'scope="register"' in register_src, (
+        "register()'s enforce_rate_limit call must use the single shared "
+        "scope=\"register\" literal, not a branch-specific scope"
+    )
