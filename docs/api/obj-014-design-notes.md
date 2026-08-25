@@ -263,3 +263,56 @@ Unchanged by this objective — restated per this role's convention:
 - `app/core/audit_log.py` remains the single owner of the structured auth-event log shape; this design adds fields to the existing `auth.rate_limit.exceeded` event type (per §2.7/§3), not a new event type.
 - `app/core/config.py` remains the single owner of runtime-tunable settings; this design adds one new setting (`RATE_LIMIT_EMAIL_RESERVED_SLOTS`) following the existing `RATE_LIMIT_IP_MULTIPLIER`/`TRUSTED_PROXY_COUNT` convention, plus the two validators in §7.
 - `docs/api/openapi.yaml` is unchanged (§5) — no new architectural surface.
+
+## §9 — Implementation note (developer, 2026-08-25/26)
+
+Implemented exactly per §3/§7 pseudocode, on branch `obj-014-developer-impl`
+(based on `origin/obj-010-013-residual-hardening`). Files: `app/core/rate_limit.py`
+(reserved-band logic inside `enforce_rate_limit`, `distinct_ip_count_for_email`
+observability addition to `_raise_rate_limited` per §2.7), `app/core/config.py`
+(`RATE_LIMIT_EMAIL_RESERVED_SLOTS: int = 1` + both field_validators from §7).
+Zero call-site diffs at any of the 6 endpoints, as designed.
+
+New tests (TDD, red confirmed before implementation via a `git stash` of the
+two source files, then green after): `tests/api/test_rate_limit_reserved_slots.py`
+(10 tests — victim-fresh-IP protection, total-ceiling-unchanged/bounded-ness,
+the reserved=0 opt-out, the defensive clamp via a direct `enforce_rate_limit`
+call, and an explicit single-IP-brute-force regression guard) and
+`tests/unit/test_rate_limit_settings_validators.py` (15 tests — both new
+field_validators' invalid/valid boundaries via the same subprocess technique
+`test_secret_key_startup.py` established, plus the `RATE_LIMIT_EMAIL_RESERVED_SLOTS`
+default-value check). Confirmed the two explicitly-rejected approaches (§2.2's
+flat per-IP cap, §2.3's unconditional first-time-IP bypass) do NOT pass: a flat
+cap below the main pool would fail `TestVictimFreshIpProtectedAfterAttackerExhaustsMainPool`'s
+first assertion (4 uncapped hits from one IP); an unconditional bypass would fail
+`TestTotalCeilingPerEmailUnchanged` (a third fresh IP is still blocked once the
+total ceiling is reached).
+
+**Significant, wider-than-anticipated blast radius found and handled:** applying
+the reserved-band mechanism via the centralized default (§3/§4's "zero call-site
+diffs" design) means ANY single, non-rotating (ip, email) pair — not just an
+attacker's — can now only ever claim `limit - RATE_LIMIT_EMAIL_RESERVED_SLOTS`
+requests, never the full `limit`, because by the time its own tally reaches the
+reserved band its own IP has necessarily already been recorded and is therefore
+ineligible for it. This is a correct, direct consequence of the §2/§6 mechanism
+as specified (not an implementation bug) — the total ceiling per email is still
+bounded at `limit` and never exceeded, and this file's own tests confirm that
+bound holds — but it silently broke 8 pre-existing regression tests across 4
+files that all happen to share the suite's "one real IP per test" shape
+(`tests/api/test_rate_limit.py`, `test_rate_limit_ip_spoofing.py`,
+`test_rate_limit_keying.py` ×2, `test_register_rate_limit.py` ×3,
+`test_resend_verification_email.py`), spanning OBJ-001/OBJ-004/OBJ-009/OBJ-013 —
+a materially larger footprint than the dispatch's explicit "OBJ-013's existing
+rate-limit-keying tests" framing anticipated. Each of those 8 was updated (not
+weakened) to assert the new, correct threshold (`limit - 1` at the default),
+with an inline comment tracing to this section — same "deliberately turn a
+previously-green test red for a documented reason" precedent this project
+already established in OBJ-003 (see `tests/README.md`). Flagged here explicitly
+per this project's `honesty_candor` posture, for `qa-engineer`/`security-specialist`
+Gate 3 review to confirm this trade-off (every non-rotating actor loses exactly
+one slot of headroom, forever, unless a second IP appears) is acceptable at the
+current default, or whether a future objective should reconsider it.
+
+Full suite: **325 passed, 0 failed** (`tests/unit` + `tests/api` combined,
+disposable Postgres 16 on port 5433, per-worktree `.venv`) — zero regressions
+once the 8 tests above were updated to the new, documented threshold.

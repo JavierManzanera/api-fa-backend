@@ -33,6 +33,17 @@ is exactly the configuration this test needs.
 
 FORGOT_PASSWORD_LIMIT = 5
 
+# OBJ-014 (obj-014-design-notes.md sections 2/3/6, finding #20 mitigation):
+# with TRUSTED_PROXY_COUNT=0, X-Forwarded-For is fully ignored, so every
+# request in this file shares ONE real (never-rotated) IP regardless of the
+# spoofed header -- exactly the shape that can only ever claim the MAIN
+# POOL (limit - reserved), not the full limit, since that one real IP is
+# already recorded against this email by the time the tally reaches the
+# reserved band. See tests/api/test_rate_limit.py's own identical comment
+# for the full reasoning; not re-derived here.
+RESERVED_SLOTS_DEFAULT = 1
+FORGOT_PASSWORD_MAIN_POOL_LIMIT = FORGOT_PASSWORD_LIMIT - RESERVED_SLOTS_DEFAULT
+
 
 async def test_varying_x_forwarded_for_does_not_bypass_forgot_password_rate_limit(
     client, api_prefix, user_factory
@@ -53,12 +64,12 @@ async def test_varying_x_forwarded_for_does_not_bypass_forgot_password_rate_limi
         )
         statuses.append(resp.status_code)
 
-    assert statuses[:FORGOT_PASSWORD_LIMIT] == [200] * FORGOT_PASSWORD_LIMIT
-    assert statuses[FORGOT_PASSWORD_LIMIT] == 429, (
+    assert statuses[:FORGOT_PASSWORD_MAIN_POOL_LIMIT] == [200] * FORGOT_PASSWORD_MAIN_POOL_LIMIT
+    assert all(status == 429 for status in statuses[FORGOT_PASSWORD_MAIN_POOL_LIMIT:]), (
         f"spoofing a different X-Forwarded-For value on every request must "
         f"NOT reset or evade the rate limit when TRUSTED_PROXY_COUNT=0 -- "
-        f"got status sequence {statuses}, expected the "
-        f"{FORGOT_PASSWORD_LIMIT + 1}th request to still be 429"
+        f"got status sequence {statuses}, expected requests from the "
+        f"{FORGOT_PASSWORD_MAIN_POOL_LIMIT + 1}th onward to be 429"
     )
 
 

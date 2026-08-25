@@ -53,6 +53,19 @@ REGISTER_RATE_LIMIT_PER_MINUTE = 5
 VALID_PASSWORD = "ValidPass123!"
 RATE_LIMIT_WINDOW_SECONDS = 60
 
+# OBJ-014 (obj-014-design-notes.md sections 2/3/6, finding #20 mitigation):
+# the last RATE_LIMIT_EMAIL_RESERVED_SLOTS (default 1) of each scope's
+# email-keyed limit are reserved for an IP not yet recorded against that
+# email this window. A single, never-rotated real IP/email pair -- the
+# shape every test below produces, since the shared `client` fixture uses
+# one real IP throughout -- can therefore only ever claim the MAIN POOL
+# (limit - reserved): by the time the tally reaches the reserved band, that
+# one real IP has already been recorded and is ineligible for it.
+# Documented, accepted trade-off (design notes section 6): strictly <= the
+# pre-OBJ-014 ceiling, never more -- protection is not weakened.
+RESERVED_SLOTS_DEFAULT = 1
+REGISTER_MAIN_POOL_LIMIT = REGISTER_RATE_LIMIT_PER_MINUTE - RESERVED_SLOTS_DEFAULT  # 4
+
 
 async def _register(client, api_prefix, email, password=VALID_PASSWORD):
     return await client.post(
@@ -81,11 +94,13 @@ async def test_register_rate_limited_after_5_requests_per_ip_email(client, api_p
         resp = await _register(client, api_prefix, email)
         statuses.append(resp.status_code)
 
-    assert statuses[:REGISTER_RATE_LIMIT_PER_MINUTE] == (
-        [200] * REGISTER_RATE_LIMIT_PER_MINUTE
-    ), f"expected the first {REGISTER_RATE_LIMIT_PER_MINUTE} requests to succeed, got {statuses}"
-    assert statuses[REGISTER_RATE_LIMIT_PER_MINUTE] == 429, (
-        f"the {REGISTER_RATE_LIMIT_PER_MINUTE + 1}th request within the window must be "
+    # OBJ-014: this same never-rotated ip/email pair can only claim the main
+    # pool (limit - reserved) -- see module-level REGISTER_MAIN_POOL_LIMIT comment.
+    assert statuses[:REGISTER_MAIN_POOL_LIMIT] == (
+        [200] * REGISTER_MAIN_POOL_LIMIT
+    ), f"expected the first {REGISTER_MAIN_POOL_LIMIT} requests to succeed, got {statuses}"
+    assert all(status == 429 for status in statuses[REGISTER_MAIN_POOL_LIMIT:]), (
+        f"requests from the {REGISTER_MAIN_POOL_LIMIT + 1}th within the window must be "
         f"rate-limited -- got status sequence {statuses}"
     )
 
@@ -112,7 +127,11 @@ async def test_register_rate_limit_resets_after_window_elapses(client, api_prefi
     email = "register-ratelimit-window@example.com"
 
     with freeze_time("2026-01-01 00:00:00") as frozen:
-        for _ in range(REGISTER_RATE_LIMIT_PER_MINUTE):
+        # OBJ-014: this never-rotated ip/email pair can only claim the main
+        # pool (limit - reserved) -- see module-level REGISTER_MAIN_POOL_LIMIT
+        # comment -- so only the first REGISTER_MAIN_POOL_LIMIT requests
+        # succeed here, not the full REGISTER_RATE_LIMIT_PER_MINUTE.
+        for _ in range(REGISTER_MAIN_POOL_LIMIT):
             resp = await _register(client, api_prefix, email)
             assert resp.status_code == 200, resp.text
 
@@ -172,15 +191,18 @@ class TestRateLimitDoesNotReopenEnumeration:
             resp = await _register(client, api_prefix, user.email)
             statuses.append(resp.status_code)
 
-        assert statuses[:REGISTER_RATE_LIMIT_PER_MINUTE] == (
-            [200] * REGISTER_RATE_LIMIT_PER_MINUTE
+        # OBJ-014: this never-rotated ip/email pair can only claim the main
+        # pool (limit - reserved) -- see module-level REGISTER_MAIN_POOL_LIMIT
+        # comment.
+        assert statuses[:REGISTER_MAIN_POOL_LIMIT] == (
+            [200] * REGISTER_MAIN_POOL_LIMIT
         ), (
             f"duplicate-email-only traffic must be rate-limited using the SAME "
             f"threshold as new-account traffic -- got {statuses}"
         )
-        assert statuses[REGISTER_RATE_LIMIT_PER_MINUTE] == 429, (
-            f"duplicate-email-only traffic must ALSO be throttled at the "
-            f"{REGISTER_RATE_LIMIT_PER_MINUTE + 1}th request -- got {statuses}. A "
+        assert all(status == 429 for status in statuses[REGISTER_MAIN_POOL_LIMIT:]), (
+            f"duplicate-email-only traffic must ALSO be throttled from the "
+            f"{REGISTER_MAIN_POOL_LIMIT + 1}th request onward -- got {statuses}. A "
             f"per-branch enforce_rate_limit call site that only covers the "
             f"new-account branch would leave this traffic completely "
             f"unthrottled (an infinite-request DoS amplification vector, "

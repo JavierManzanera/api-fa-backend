@@ -189,8 +189,17 @@ async def test_resend_rate_limited_after_5_requests_per_ip_email(
 ):
     """Design notes section 2.2 point 1:
     RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE = 5, same value as
-    FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE."""
+    FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE.
+
+    OBJ-014 (obj-014-design-notes.md sections 2/3/6, finding #20
+    mitigation): the last RATE_LIMIT_EMAIL_RESERVED_SLOTS (default 1) of
+    each scope's email-keyed limit are reserved for an IP not yet recorded
+    against that email this window. This test's never-rotated real IP
+    (the shared `client` fixture uses one throughout) can therefore only
+    ever claim the main pool (limit - reserved) -- documented, accepted
+    trade-off, design notes section 6."""
     user, _ = await user_factory(email="resend-ratelimit@example.com", is_verified=False)
+    main_pool_limit = RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE - 1  # RATE_LIMIT_EMAIL_RESERVED_SLOTS default
 
     statuses = []
     for _ in range(RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE + 1):
@@ -199,10 +208,8 @@ async def test_resend_rate_limited_after_5_requests_per_ip_email(
         )
         statuses.append(resp.status_code)
 
-    assert statuses[:RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE] == (
-        [200] * RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE
-    )
-    assert statuses[-1] == 429
+    assert statuses[:main_pool_limit] == [200] * main_pool_limit
+    assert all(status == 429 for status in statuses[main_pool_limit:])
 
 
 async def test_resend_429_response_carries_retry_after(client, api_prefix, user_factory):

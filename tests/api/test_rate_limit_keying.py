@@ -73,6 +73,21 @@ RATE_LIMIT_IP_MULTIPLIER = 5
 REGISTER_IP_LIMIT = REGISTER_EMAIL_LIMIT * RATE_LIMIT_IP_MULTIPLIER  # 25
 FORGOT_PASSWORD_IP_LIMIT = FORGOT_PASSWORD_EMAIL_LIMIT * RATE_LIMIT_IP_MULTIPLIER  # 25
 
+# OBJ-014 (obj-014-design-notes.md sections 2/3/6, finding #20 mitigation):
+# the last RATE_LIMIT_EMAIL_RESERVED_SLOTS (default 1) of each scope's
+# email-keyed limit are reserved for an IP not yet recorded against that
+# email this window. A single, never-rotated real IP/email pair (the shape
+# every "same email, same IP" test in this file below produces, since the
+# shared `client` fixture uses one real IP throughout and
+# TRUSTED_PROXY_COUNT=0 makes a spoofed X-Forwarded-For decorative) can
+# therefore only ever claim the MAIN POOL (limit - reserved) -- by the time
+# the tally reaches the reserved band, that one real IP has already been
+# recorded and is ineligible for it. Documented, accepted trade-off (design
+# notes section 6): strictly <= the pre-OBJ-014 ceiling, never more.
+RESERVED_SLOTS_DEFAULT = 1
+REGISTER_MAIN_POOL_LIMIT = REGISTER_EMAIL_LIMIT - RESERVED_SLOTS_DEFAULT  # 4
+FORGOT_PASSWORD_MAIN_POOL_LIMIT = FORGOT_PASSWORD_EMAIL_LIMIT - RESERVED_SLOTS_DEFAULT  # 4
+
 
 async def _register(client, api_prefix, email, password=VALID_PASSWORD, headers=None):
     return await client.post(
@@ -162,10 +177,13 @@ class TestSpoofedXffRotationRegressionGuard:
             )
             statuses.append(resp.status_code)
 
-        assert statuses[:REGISTER_EMAIL_LIMIT] == [200] * REGISTER_EMAIL_LIMIT, (
+        # OBJ-014: the real (never-rotated) IP can only claim the main pool
+        # (limit - reserved) -- see module-level comment above
+        # REGISTER_MAIN_POOL_LIMIT.
+        assert statuses[:REGISTER_MAIN_POOL_LIMIT] == [200] * REGISTER_MAIN_POOL_LIMIT, (
             f"got {statuses}"
         )
-        assert statuses[REGISTER_EMAIL_LIMIT] == 429, (
+        assert all(status == 429 for status in statuses[REGISTER_MAIN_POOL_LIMIT:]), (
             f"a spoofed, per-request-varying X-Forwarded-For must NOT extend the "
             f"budget beyond the original {REGISTER_EMAIL_LIMIT} -- got {statuses}. "
             f"TRUSTED_PROXY_COUNT=0 means the header is decorative; the real IP "
@@ -227,12 +245,15 @@ class TestOriginalPerEmailLimitsUnchanged:
             )
             statuses.append(resp.status_code)
 
-        assert statuses[:FORGOT_PASSWORD_EMAIL_LIMIT] == [200] * FORGOT_PASSWORD_EMAIL_LIMIT
-        assert statuses[FORGOT_PASSWORD_EMAIL_LIMIT] == 429, (
-            f"the email-keyed limit for /forgot-password (unchanged at "
-            f"{FORGOT_PASSWORD_EMAIL_LIMIT}/min) must still trip on the "
-            f"{FORGOT_PASSWORD_EMAIL_LIMIT + 1}th request from the same (ip, email) "
-            f"-- got {statuses}"
+        # OBJ-014: this SAME (never-rotated) ip/email pair can only claim the
+        # main pool (limit - reserved) -- see module-level comment above
+        # FORGOT_PASSWORD_MAIN_POOL_LIMIT. The email-keyed TOTAL ceiling is
+        # still bounded at (and never exceeds) FORGOT_PASSWORD_EMAIL_LIMIT.
+        assert statuses[:FORGOT_PASSWORD_MAIN_POOL_LIMIT] == [200] * FORGOT_PASSWORD_MAIN_POOL_LIMIT
+        assert all(status == 429 for status in statuses[FORGOT_PASSWORD_MAIN_POOL_LIMIT:]), (
+            f"the email-keyed limit for /forgot-password must still trip once "
+            f"the same (ip, email) has consumed its main-pool allotment "
+            f"({FORGOT_PASSWORD_MAIN_POOL_LIMIT}) -- got {statuses}"
         )
 
     async def test_verify_otp_still_429s_on_11th_request_same_email_and_ip(
