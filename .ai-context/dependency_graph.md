@@ -33,7 +33,11 @@ a specific finding number — read the cited finding, don't trust a one-line par
    ├── [OBJ-005] Email Verification Flow (MEDIUM)
    └── [OBJ-006] Migrations & Supply Chain Hardening (LOW)
 
-[OBJ-007] Registration Enumeration Policy Decision (LOW) — decision made 2026-08-25, now in Phase 2.
+[OBJ-007] Registration Enumeration Policy Decision (LOW) — CLOSED 2026-08-25 (Gate 3 unanimous
+PASS, PR pending merge).
+
+[OBJ-008] Replace python-jose with PyJWT[cryptography] (LOW, backlog) — removes the ecdsa
+dependency (and its suppressed CVE) from the tree entirely, not urgent.
 ```
 
 ## Active Objectives Status
@@ -49,6 +53,8 @@ a specific finding number — read the cited finding, don't trust a one-line par
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | **CLOSED** (`c4c518b` + PR #1 merge `2bc6eb6`) | audit-report.md #12, #14 |
 | OBJ-007 | `/register` switches to generic anti-enumeration response (matches `/forgot-password`) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (PR pending) | audit-report.md #6 |
 | — | `/register` DoS amplification via missing rate limit (finding #16) | security-specialist found it | Not Started (backlog) | audit-report.md §Gate 3 OBJ-007 |
+| — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | **CLOSED** (PR #4 merged) | audit-report.md #15 |
+| OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | Not Started (backlog, LOW, no deadline) | audit-report.md #15 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
 
@@ -151,6 +157,24 @@ pay a real bcrypt cost too (previously near-free) — the one remaining unauthen
 with no rate limiting just got a genuine CPU-exhaustion amplification vector. Not urgent enough to
 block OBJ-007's Gate 3, but real. Candidate for a dedicated small objective or folding into
 whichever next touches `/register`.
+
+## Finding #15 remediation — `ALGORITHM` config guardrail
+
+Status: CLOSED (commit `b97f9a5`, live-verified 267/267 green on `tests/unit`+`tests/api` 2026-08-25
+— PR #4 merged) | Agent chain: security-specialist → developer → qa-engineer
+Docs: security=`audit-report.md` §"Auditoría puntual — PYSEC-2026-1325 / python-ecdsa / ALGORITHM
+sin validar (2026-08-25)" (finding #15, MEDIUM)
+Fail-closed `field_validator` on `Settings.ALGORITHM` restricting it to `{"HS256"}`, same pattern as
+`POSTGRES_SSL_MODE`/`ENVIRONMENT`. User approved doing this now (2026-08-25); durable fix (dropping
+`python-jose` entirely) tracked separately as OBJ-008 backlog.
+
+## OBJ-008 — Replace `python-jose` with `PyJWT[cryptography]` (backlog)
+
+Status: Not Started, backlog (LOW, no deadline) | Traces to: audit-report.md #15
+Rationale: removes `ecdsa` (and the suppressed `PYSEC-2026-1325` CVE) from the dependency tree
+entirely instead of reasoning about reachability indefinitely. security-specialist scoped it as
+~2 app files + 8 test files, near-identical API — user approved opening this as a tracked backlog
+item (2026-08-25), not urgent.
 
 ## Commits
 

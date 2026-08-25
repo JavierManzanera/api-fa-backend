@@ -17,6 +17,13 @@ _VALID_POSTGRES_SSL_MODES = {"disable", "require", "verify-full"}
 # case-sensitivity convention as _VALID_POSTGRES_SSL_MODES.
 _VALID_ENVIRONMENTS = {"development", "staging", "production"}
 
+# Security finding #15 (docs/security/audit-report.md, "Auditoria puntual --
+# PYSEC-2026-1325 / python-ecdsa / ALGORITHM sin validar", 2026-08-25): only
+# algorithm supported/tested by this codebase today. Deliberately widen (and
+# only after confirming the state of PYSEC-2026-1325 and/or migrating to
+# PyJWT) if a fork needs RS*/ES*.
+_VALID_ALGORITHMS = {"HS256"}
+
 # Known-placeholder values that must never be used as a real SECRET_KEY,
 # compared case-insensitively (obj-001-design-notes.md section 3).
 _SECRET_KEY_BLOCKLIST = {
@@ -139,6 +146,29 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"POSTGRES_SSL_MODE must be one of "
                 f"{sorted(_VALID_POSTGRES_SSL_MODES)}, got {value!r}."
+            )
+        return value
+
+    # Security finding #15 (docs/security/audit-report.md, "Auditoria
+    # puntual -- PYSEC-2026-1325 / python-ecdsa / ALGORITHM sin validar"):
+    # fail closed, same pattern as POSTGRES_SSL_MODE/ENVIRONMENT above.
+    # Runtime exposure to PYSEC-2026-1325 (unfixed side-channel advisory in
+    # the pure-Python `ecdsa` package, pulled in transitively by
+    # `python-jose`) is confirmed zero today -- this app only ever uses
+    # HS256 -- but that was previously an observed fact, not an enforced
+    # invariant. This validator makes it one.
+    @field_validator("ALGORITHM")
+    @classmethod
+    def validate_algorithm(cls, value: str) -> str:
+        if value not in _VALID_ALGORITHMS:
+            raise ValueError(
+                f"ALGORITHM must be one of {sorted(_VALID_ALGORITHMS)}, got "
+                f"{value!r}. ES*/RS*/EdDSA algorithms are not currently "
+                "supported by this template's validated configuration surface "
+                "-- see audit-report.md finding #15 before enabling one "
+                "(python-jose's EC path can fall back to the unpatched "
+                "python-ecdsa side-channel advisory PYSEC-2026-1325 if the "
+                "cryptography package is ever unavailable)."
             )
         return value
 
