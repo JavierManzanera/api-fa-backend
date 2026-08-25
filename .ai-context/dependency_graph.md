@@ -41,6 +41,18 @@ its suppressed CVE) from the tree entirely. CLOSED 2026-08-25 (Gate 3 unanimous 
 
 [OBJ-009] Rate limiting on /register (finding #16) — closes the DoS amplification gap OBJ-007's
 own timing-parity fix introduced. CLOSED 2026-08-25 (Gate 3 unanimous PASS, PR pending).
+
+[OBJ-010] Migration 0008 safe-deploy: reorder /auth/refresh rotation handler + TOCTOU fix on that
+same code path. In progress 2026-08-25.
+
+[OBJ-011] provision_db_roles.sql greenfield-deploy fix (DML-grant block assumes tables exist).
+In progress 2026-08-25.
+
+[OBJ-012] Real TLS-terminated-Postgres DAST verification (sandbox never had certs to test against).
+In progress 2026-08-25.
+
+[OBJ-013] Rate-limiter AND-keying hardening (finding #17) — affects all 6 rate-limited endpoints.
+In progress 2026-08-25.
 ```
 
 ## Active Objectives Status
@@ -58,6 +70,10 @@ own timing-parity fix introduced. CLOSED 2026-08-25 (Gate 3 unanimous PASS, PR p
 | — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | **CLOSED** (PR #4 merged) | audit-report.md #15 |
 | OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | **CLOSED** (PR #7 merged `d6d5771`) | audit-report.md #15 |
 | OBJ-009 | Rate limiting on `/register` (finding #16, DoS amplification) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (Gate 3 unanimous PASS, PR pending) | audit-report.md §Gate 3 OBJ-007 |
+| OBJ-010 | Reorder `/auth/refresh` rotation handler (revoke→insert→link) so migration 0008 is safe; combined TOCTOU atomic-UPDATE fix on the same code | developer → database-architect (apply 0008, unpin CI) → qa-engineer ∥ security-specialist | Dispatched | obj-006-migration-plan.md "CRITICAL finding" + §5 |
+| OBJ-011 | `provision_db_roles.sql` DML-grant block assumes tables exist — fails on a genuine greenfield deploy | database-architect | Dispatched | obj-006-migration-plan.md "devops-engineer pass" #2 |
+| OBJ-012 | Real TLS-terminated-Postgres DAST check (sandbox never had certs to verify `require`/`verify-full` against) | devops-engineer → security-specialist | Dispatched | obj-003-design-notes.md residual note |
+| OBJ-013 | Harden `enforce_rate_limit` keying (finding #17): AND-combined `(scope,ip,email)` is trivially resettable by rotating either field | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | Dispatched | audit-report.md §Gate 3 OBJ-009 (finding #17) |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
 
