@@ -239,6 +239,24 @@ to ignore).
   for the whole batch. Doesn't replace the normal one-objective-one-PR pattern for objectives spaced
   further apart in time — this is specifically for a wave of parallel work opened together.
 
+- **2026-08-26, PR #12 merged (OBJ-010..014); post-merge audit-doc cleanup found a real functional
+  gap, not just cosmetic debt.** User asked whether the project could be called "bulletproof/complete
+  against all known vulnerabilities" — answer given: no, that framing overclaims (no independent
+  pentest, green tests only prove the specific scenarios tested, vulnerability landscape moves daily).
+  Approved fixing 2 cheap remaining items: (a) 3 stale "Pendiente" rows in `audit-report.md`'s
+  findings-index for work that was actually already done (#12, #14, `rate_limit_hits` TTL — all
+  confirmed genuinely closed, this was a documentation-currency lapse, not a real gap); (b) finding
+  #19 wording fix + `notifications.py`/`EmailSender` coexistence cleanup. (b)'s investigation
+  surfaced that `notifications.py` was NOT dead code as assumed — it was `/auth/forgot-password`'s
+  only production call site, and had been a documented OBJ-004 no-op placeholder that OBJ-005 was
+  supposed to retire (per `obj-005-design-notes.md` §4.1) but never did. **Net: password-reset emails
+  were never actually delivered to any user since OBJ-004** — silently 200'd while the delivery
+  function did nothing. No security regression (the no-op never leaked the OTP), but a real, quiet
+  functional gap the whole time, invisible because tests mocked the seam instead of exercising real
+  delivery. Fixed in PR #13: `/forgot-password` now uses `EmailSender` like every other endpoint.
+  Lesson: green tests only prove what they were written to exercise — worth remembering before
+  calling any objective "done" on green alone.
+
 
 - OBJ-001 is the priority tranche: findings #1+#2 chain into an unauthenticated full
   account-takeover (enumerate email → brute-force OTP → reset password → stolen refresh token from

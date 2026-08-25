@@ -433,8 +433,8 @@ class TestNoRawSecretsInAnyLogRecord:
     Raw password... Raw OTP code... Raw JWT string.' This class drives a
     full flow (register -> login -> forgot-password -> verify-otp ->
     reset-password -> refresh -> logout) using REAL secret values (the
-    actual password, the actual OTP recovered via the notification seam,
-    the actual issued JWTs) and asserts NONE of them appear as a substring
+    actual password, the actual OTP recovered from the recording EmailSender
+    override, the actual issued JWTs) and asserts NONE of them appear as a substring
     in ANY captured log record's message, from ANY logger -- not just
     app.audit (a leak through some other logger, e.g. an errant debug
     print piped through logging, would be just as real a finding)."""
@@ -442,7 +442,10 @@ class TestNoRawSecretsInAnyLogRecord:
     async def test_full_flow_never_logs_a_raw_secret(
         self, client, api_prefix, user_factory, caplog
     ):
-        from unittest.mock import patch
+        import re
+
+        from app.api import deps
+        from app.main import app
 
         password = "SuperSecretPass987!"
         user, _ = await user_factory(email="audit-no-leak@example.com", password=password)
@@ -454,16 +457,22 @@ class TestNoRawSecretsInAnyLogRecord:
         access_token = login_resp.json()["access_token"]
         refresh_token = login_resp.json()["refresh_token"]
 
-        with patch(
-            "app.api.v1.endpoints.auth.notifications.send_otp_notification"
-        ) as mock_send:
-            fp_resp = await client.post(
-                f"{api_prefix}/auth/forgot-password", json={"email": user.email}
-            )
+        class _RecordingEmailSender:
+            def __init__(self):
+                self.calls = []
+
+            async def send(self, *, to, subject, body, html_body=None):
+                self.calls.append({"to": to, "subject": subject, "body": body})
+
+        sender = _RecordingEmailSender()
+        app.dependency_overrides[deps.get_email_sender] = lambda: sender
+
+        fp_resp = await client.post(
+            f"{api_prefix}/auth/forgot-password", json={"email": user.email}
+        )
         assert fp_resp.status_code == 200
-        call_args = mock_send.call_args
-        all_args = list(call_args.args) + list(call_args.kwargs.values())
-        real_otp = next(a for a in all_args if isinstance(a, str) and a.isdigit() and len(a) == 6)
+        assert len(sender.calls) == 1
+        real_otp = re.search(r"\d{6}", sender.calls[0]["body"]).group()
 
         # One wrong guess (produces a failed_attempt log line) then the real one.
         await client.post(

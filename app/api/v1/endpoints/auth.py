@@ -13,10 +13,13 @@ from app.api import deps
 from app.core import security
 from app.core import rate_limit
 from app.core import audit_log
-from app.core import notifications
 from app.core.config import settings
 from app.core.email.base import EmailSender, EmailSendError
-from app.core.email.templates import render_verification_email, render_already_registered_email
+from app.core.email.templates import (
+    render_verification_email,
+    render_already_registered_email,
+    render_password_reset_email,
+)
 from app.models.user import User
 from app.models.verification import Verification
 from app.models.refresh_session import RefreshSession
@@ -400,7 +403,8 @@ async def login(
 async def forgot_password(
     http_request: Request,
     payload: EmailRequest,
-    db: AsyncSession = Depends(deps.get_db)
+    db: AsyncSession = Depends(deps.get_db),
+    email_sender: EmailSender = Depends(deps.get_email_sender),
 ) -> Any:
     ip = rate_limit.client_ip(http_request)
     await rate_limit.enforce_rate_limit(
@@ -465,16 +469,29 @@ async def forgot_password(
 
     # OBJ-004 finding #10, part 2 (obj-004-design-notes.md section 5): the
     # debug print is gone -- a non-secret-leaking audit-log line (email/ip/
-    # purpose only, never the raw OTP) plus the interim delivery seam, which
-    # is the ONLY place allowed to receive the raw OTP outside of generation
-    # and hashing.
+    # purpose only, never the raw OTP) is logged before the send attempt.
     audit_log.log_auth_event(
         "auth.otp.requested",
         email=payload.email,
         ip=ip,
         purpose=RESET_PASSWORD_PURPOSE,
     )
-    notifications.send_otp_notification(payload.email, otp, purpose=RESET_PASSWORD_PURPOSE)
+
+    # Migrated from the interim `notifications.send_otp_notification` no-op
+    # seam (OBJ-004) onto the `EmailSender` abstraction (OBJ-005 design notes
+    # section 4.1 -- the Gate-1-approved end state was always exactly one
+    # delivery mechanism, not two coexisting ones; audit-report.md finding
+    # "notifications.py/EmailSender coexisting" flagged this migration as
+    # outstanding). Mirrors /resend-verification-email's error handling
+    # exactly: a send failure does NOT get /register's "roll back and fail
+    # loudly" treatment -- the Verification row above is already committed,
+    # and this endpoint's anti-enumeration contract already tolerates a "we
+    # said we sent it" trust model. Still the same generic 200 either way.
+    subject, body = render_password_reset_email(otp)
+    try:
+        await email_sender.send(to=payload.email, subject=subject, body=body)
+    except EmailSendError:
+        pass
 
     return {"msg": GENERIC_OTP_SENT_MESSAGE}
 

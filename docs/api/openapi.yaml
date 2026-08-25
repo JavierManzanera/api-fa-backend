@@ -268,12 +268,20 @@ paths:
         `obj-003-design-notes.md` §1.
 
         **Changed by OBJ-004 (finding #10, informational only):** the debug `print`
-        that previously wrote the raw OTP to stdout has been removed. OTP delivery now
-        goes through a temporary placeholder seam (`app/core/notifications.py`) pending
-        OBJ-005's real pluggable email-sender abstraction; a structured
+        that previously wrote the raw OTP to stdout has been removed. OTP delivery
+        went through a temporary placeholder seam (`app/core/notifications.py`)
+        pending OBJ-005's real pluggable email-sender abstraction; a structured
         `auth.otp.requested` audit-log event is emitted instead (email, IP, purpose —
         never the OTP value itself). No request/response contract change; see
         `obj-004-design-notes.md` §5.
+
+        **Changed by the 2026-08-26 audit-cleanup pass (informational only):** the
+        placeholder seam above is retired. OTP delivery now goes through the real
+        `EmailSender` abstraction (the same mechanism `/register` and
+        `/resend-verification-email` already use), per `obj-005-design-notes.md` §4.1's
+        originally-designed end state. No request/response contract change — this
+        endpoint's HTTP behavior is unchanged; see `audit-report.md`'s
+        "Cleanup pass — hallazgo #19 ... / notifications.py/EmailSender" section.
       requestBody:
         required: true
         content:
