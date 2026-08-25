@@ -2,6 +2,10 @@
 OBJ-003 finding #5 -- timing side-channel / user enumeration via response
 latency on `/auth/login` and `/auth/forgot-password`, plus the OBJ-002
 Gate 3 SAST fold-in on `/auth/logout` (obj-003-design-notes.md section 3.3).
+Extended in OBJ-005's own Gate 3 (docs/security/audit-report.md, "Gate 3 --
+Verificacion OBJ-005") to a fourth endpoint, `/auth/resend-verification-
+email`, which shipped without this same mitigation --
+TestResendVerificationEmailConstantTimeGuarantee below.
 
 No Gherkin/AC doc exists for OBJ-003 -- see tests/unit/test_otp_hashing.py's
 docstring for the full explanation of the derivation approach. Scenarios
@@ -223,6 +227,114 @@ class TestForgotPasswordConstantTimeGuarantee:
             "call must target DUMMY_PASSWORD_HASH -- it must never verify "
             "against a real user's hashed_password (no password is being "
             "checked here at all, only padding the response cost)"
+        )
+
+
+class TestResendVerificationEmailConstantTimeGuarantee:
+    """Gate 3 security finding (docs/security/audit-report.md, "Gate 3 --
+    Verificacion OBJ-005", "[NUEVO - MEDIO] /auth/resend-verification-email
+    sin la mitigacion de timing de finding #5"). Mirrors
+    TestForgotPasswordConstantTimeGuarantee exactly -- same unconditional
+    `verify_password_or_dummy(payload.email, None)` call, same
+    DUMMY_PASSWORD_HASH target in every branch (this endpoint never checks
+    a real password either). One extra branch this endpoint has that
+    /forgot-password doesn't: an existing, ALREADY-VERIFIED email must also
+    take the fast/no-op path (design docstring: "an already-verified
+    user's resend is a silent no-op") -- the dummy-work call must still
+    fire exactly once there too, or verification status becomes a second
+    oracle dimension.
+    """
+
+    async def test_resend_with_nonexistent_email_calls_verify_password_once(
+        self, client, api_prefix
+    ):
+        with patch(
+            "app.core.security.verify_password", wraps=security.verify_password
+        ) as mock_verify:
+            resp = await client.post(
+                f"{api_prefix}/auth/resend-verification-email",
+                json={"email": "rve-nonexistent@example.com"},
+            )
+
+        assert resp.status_code == 200
+        assert mock_verify.call_count == 1, (
+            f"security.verify_password must be called exactly ONCE on "
+            f"/auth/resend-verification-email for a nonexistent email "
+            f"(audit-report.md Gate 3 OBJ-005 finding) -- was called "
+            f"{mock_verify.call_count} time(s). Today's code has no "
+            f"password-verification call anywhere in this handler at all."
+        )
+
+    async def test_resend_with_existing_unverified_email_calls_verify_password_once(
+        self, client, api_prefix, user_factory
+    ):
+        user, _ = await user_factory(
+            email="rve-unverified@example.com", is_verified=False
+        )
+
+        with patch(
+            "app.core.security.verify_password", wraps=security.verify_password
+        ) as mock_verify:
+            resp = await client.post(
+                f"{api_prefix}/auth/resend-verification-email", json={"email": user.email}
+            )
+
+        assert resp.status_code == 200
+        assert mock_verify.call_count == 1, (
+            "the SAME unconditional dummy-work call must also fire for an "
+            "EXISTING, unverified email (the slow path -- extra queries/"
+            "writes/email send) -- otherwise the found/not-found asymmetry "
+            "the fix targets would just move rather than close"
+        )
+
+    async def test_resend_with_existing_already_verified_email_calls_verify_password_once(
+        self, client, api_prefix, user_factory
+    ):
+        """The extra branch this endpoint has that /forgot-password
+        doesn't: an already-verified user also takes the fast/no-op path,
+        and must be indistinguishable in cost from both the nonexistent-
+        email and the unverified-email cases."""
+        user, _ = await user_factory(
+            email="rve-already-verified@example.com", is_verified=True
+        )
+
+        with patch(
+            "app.core.security.verify_password", wraps=security.verify_password
+        ) as mock_verify:
+            resp = await client.post(
+                f"{api_prefix}/auth/resend-verification-email", json={"email": user.email}
+            )
+
+        assert resp.status_code == 200
+        assert mock_verify.call_count == 1, (
+            "an existing, ALREADY-VERIFIED email must also cause exactly "
+            "ONE dummy-work call -- without it, verification status "
+            "becomes a second timing oracle dimension distinct from "
+            "existence"
+        )
+
+    async def test_resend_always_targets_the_dummy_hash_never_a_real_one(
+        self, client, api_prefix, user_factory
+    ):
+        user, _ = await user_factory(
+            email="rve-target-check@example.com", is_verified=False
+        )
+
+        with patch(
+            "app.core.security.verify_password", wraps=security.verify_password
+        ) as mock_verify:
+            await client.post(
+                f"{api_prefix}/auth/resend-verification-email", json={"email": user.email}
+            )
+
+        assert mock_verify.call_count == 1
+        called_target_hash = mock_verify.call_args.args[1]
+        assert called_target_hash == security.DUMMY_PASSWORD_HASH, (
+            "even for an existing email, /auth/resend-verification-email's "
+            "dummy-work call must target DUMMY_PASSWORD_HASH -- it must "
+            "never verify against a real user's hashed_password (no "
+            "password is being checked here at all, only padding the "
+            "response cost)"
         )
 
 

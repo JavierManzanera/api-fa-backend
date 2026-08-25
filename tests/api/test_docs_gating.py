@@ -55,6 +55,18 @@ BASE_ENV_FIELDS = {
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
     "REFRESH_TOKEN_EXPIRE_DAYS": "7",
+    # PROACTIVE FIX (same convention documented in
+    # test_postgres_ssl_mode_startup.py's own docstring): this file
+    # parametrizes ENVIRONMENT over all three values including
+    # "production", and the new EMAIL_PROVIDER/ENVIRONMENT cross-field
+    # validator (tests/unit/test_email_provider_startup.py,
+    # audit-report.md Gate 3 OBJ-005) now rejects
+    # ENVIRONMENT=production + EMAIL_PROVIDER="console" (the default) at
+    # import time -- without this, every production-environment case here
+    # would fail for an unrelated reason (Settings() raising before the
+    # ASGI probe ever runs), masking this file's own docs-gating behavior
+    # under test.
+    "EMAIL_PROVIDER": "smtp",
 }
 
 _ASGI_PROBE_SCRIPT = """

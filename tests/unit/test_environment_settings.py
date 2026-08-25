@@ -78,6 +78,17 @@ BASE_ENV_FIELDS = {
     "ALGORITHM": "HS256",
     "ACCESS_TOKEN_EXPIRE_MINUTES": "30",
     "REFRESH_TOKEN_EXPIRE_DAYS": "7",
+    # PROACTIVE FIX (same convention this file's own docstring already
+    # documents for POSTGRES_SSL_MODE/SECRET_KEY carry-overs): this file's
+    # TestValidEnvironmentsPermitStartup parametrizes over all three
+    # ENVIRONMENT values including "production", and the new EMAIL_PROVIDER/
+    # ENVIRONMENT cross-field validator (tests/unit/test_email_provider_
+    # startup.py, audit-report.md Gate 3 OBJ-005) now rejects
+    # ENVIRONMENT=production + EMAIL_PROVIDER="console" (the default) at
+    # import time -- without this, the production case here would fail for
+    # an unrelated reason, masking this file's own ENVIRONMENT-field
+    # validation under test.
+    "EMAIL_PROVIDER": "smtp",
 }
 
 

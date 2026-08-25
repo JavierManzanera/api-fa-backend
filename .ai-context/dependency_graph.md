@@ -45,7 +45,7 @@ user, not on any other objective's code.
 | OBJ-001 | JWT type confusion fix; OTP CSPRNG+lockout+rate-limit; `SECRET_KEY` validation | business-analyst → solution-architect ∥ security-specialist → qa-engineer → developer | **CLOSED** (commit `b733c17`) | audit-report.md #1, #2, #4 |
 | OBJ-002 | `/logout`+revocation; refresh rotation+reuse detection; `token_version` invalidation | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `33b7aa0`) | audit-report.md #3 |
 | OBJ-003 | OTP HMAC-at-rest; TLS to Postgres; timing side-channel mitigation | solution-architect → database-architect ∥ qa-engineer → developer | **CLOSED** (commit `5ce5e2c`) | audit-report.md #5, #7, #8 |
-| OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | Gate 2 approved 2026-08-25; Phase 3 implementation done, **Gate 3 verification in progress** | audit-report.md #9, #10, #13 |
+| OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | **CLOSED** (commit `bcd058f`) | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | Phase 2 done, **Gate 2 awaiting approval** | audit-report.md #11 |
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | database-architect piece DONE; devops-engineer piece **not started** | audit-report.md #12, #14 |
 | OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
@@ -98,34 +98,18 @@ deploys relying on `require`/`verify-full`.
 
 ## OBJ-004 — HTTP Security Baseline
 
-Status: Gate 2 approved (2026-08-25) | Phase 3 implementation done (developer, 2026-08-25) |
-**Gate 3 verification in progress** (qa-engineer ∥ security-specialist dispatched) | Agent chain:
-solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist
-Docs: design=`docs/api/obj-004-design-notes.md` · tests=`docs/testing/obj-004-test-report.md`
-Gate 1 decisions (APPROVED 2026-08-23): CORS default origins = empty list (safe default) · CSP
-scope for `/docs`/`/redoc` = scoped CDN exemption (adopted, no genuine tradeoff — alternative
-breaks default Swagger UI) · OTP delivery interim seam = add the minimal monkeypatchable no-op now
-(adopted, low-stakes/reversible) · `X-Forwarded-For` trust = configurable `TRUSTED_PROXY_COUNT`,
-default `0`/untrusted (adopted).
-Phase 3 (developer, 2026-08-25): 4 files modified (`auth.py`, `config.py`, `rate_limit.py`,
-`main.py`) + 3 new (`security_headers.py`, `audit_log.py`, `notifications.py`). Full suite:
-109 failed/135 passed → 40 failed/204 passed (244 total); the 40 remaining are pre-existing
-OBJ-005 red-phase tests, untouched. Zero regressions. OTP seam:
-`app.core.notifications.send_otp_notification(email: str, otp: str, *, purpose: str) -> None`,
-imported module-level in `auth.py` — patch target for tests is
-`app.api.v1.endpoints.auth.notifications.send_otp_notification`. One deviation from design notes:
-`BACKEND_CORS_ORIGINS` needed `Annotated[List[AnyHttpUrl], NoDecode]` (pydantic-settings 2.15
-quirk), not a bare `List[AnyHttpUrl]` — validator logic unchanged.
-Open items: environment blocker (`greenlet`/Windows Application Control) confirmed RESOLVED
-2026-08-25 (machine rebooted) — no longer blocking. Gate 3: qa-engineer PASS (40 failed/204 passed,
-independently confirmed, zero regressions) + security-specialist PASS (findings #9, #10, #13 all
-CLOSED, zero new findings, zero blockers). **Gate 3: awaiting user approval to commit+push and
-close.**
+Status: CLOSED (commit `bcd058f`) | Agent chain: solution-architect → qa-engineer → developer →
+qa-engineer ∥ security-specialist
+Docs: design=`docs/api/obj-004-design-notes.md` · tests=`docs/testing/obj-004-test-report.md` ·
+security=`audit-report.md` §"Gate 3 — Verificación OBJ-004"
+OTP seam for OBJ-005: `app.core.notifications.send_otp_notification(email, otp, *, purpose)` in
+`app/core/notifications.py`, imported module-level in `auth.py`.
 
 ## OBJ-005 — Email Verification Flow
 
-Status: Phase 2 done (2026-08-24) | **Gate 2: awaiting user approval** | Agent chain:
-business-analyst → solution-architect → qa-engineer → developer
+Status: Gate 2 approved (2026-08-25) | Phase 3 implementation done (developer, 2026-08-25) |
+**Gate 3 verification in progress** (qa-engineer ∥ security-specialist dispatched) | Agent chain:
+business-analyst → solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist
 Docs: requirements=`docs/requirements/obj-005-email-verification-flow.md` ·
 design=`docs/api/obj-005-design-notes.md` · tests=`docs/testing/obj-005-test-report.md`
 Gate 1 decisions (APPROVED 2026-08-23): login enforcement = block unverified users (Option A) ·
@@ -135,11 +119,38 @@ surface area · email send failure = fail the registration (rollback, `503`) · 
 reuse existing rate-limit/cooldown infra · login/refresh `is_verified` enforcement mechanics =
 distinguishable `400 "Email not verified"`, adopted 2026-08-24 without a separate ask (extends the
 already-Gate-3-reviewed `is_active` precedent by one predicate, doesn't reopen finding #5).
-Open items: **CRITICAL cross-cutting test risk** — `tests/factories.py`'s `create_user` defaults to
-`is_verified=False`; zero existing tests across OBJ-001–004 override it, so once login enforcement
-lands, ~13 pre-existing test files will regress unless `developer` also flips the default to
-`is_verified=True` in the same Phase 3 pass (full detail in
-`docs/testing/obj-005-test-report.md`). Same `greenlet` environment blocker as OBJ-004/006.
+Phase 3 (developer, 2026-08-25): new `app/core/email/` package (`EmailSender` ABC + `EmailSendError`
+in `base.py`, `ConsoleEmailSender` in `console.py`, template renderers in `templates.py`) wired via
+`Depends(deps.get_email_sender)`; `POST /auth/verify-email` + `POST /auth/resend-verification-email`
+added; `/auth/register` creates an `email_verification` row and sends via `EmailSender`, rolling
+back + `503` on `EmailSendError`; `/auth/login` + `/auth/refresh` gain the `is_verified` check.
+`tests/factories.py`'s `create_user` default flipped `is_verified` False→True (the flagged
+cross-cutting fix, landed in this pass). Full suite: 40 failed/204 passed → **244/244 passed**,
+zero regressions. Deviation from design §4.1: `app/core/notifications.py` (OBJ-004's seam) was
+kept, NOT retired/routed through `EmailSender` — three pre-existing green tests patch it directly
+by name; retiring it would have broken them. `/forgot-password` still uses the old seam;
+`EmailSender` is wired into `/register` + `/resend-verification-email` only, per what OBJ-005's own
+tests actually require.
+Open items: Gate 3: qa-engineer PASS (244/244, independently re-executed, `is_verified` default
+flip confirmed safe by reading not just green) + security-specialist PASS on finding #11 (genuinely
+closed, not bypassable) but **2 new MEDIUM findings from this objective's own additions** (neither
+reopens a closed finding, security-specialist says neither blocks Gate 3 sign-off): (1)
+`EMAIL_PROVIDER` has no fail-closed startup validation — a fork reaching `ENVIRONMENT=production`
+without configuring a real provider silently logs OTPs in plaintext via `ConsoleEmailSender`,
+reintroducing #10's exposure class; (2) `POST /auth/resend-verification-email` lacks the
+`verify_password_or_dummy` timing-parity call `/forgot-password` uses for finding #5, reopening a
+bounded email-existence/verification-status enumeration channel via response latency. **User
+decision (2026-08-25): fix both now in this same pass** — done: `developer` added
+`Settings.validate_email_provider_not_console_in_production` (`app/core/config.py`, fails startup
+on `ENVIRONMENT=="production"` + `EMAIL_PROVIDER=="console"`) and an unconditional
+`verify_password_or_dummy` call in `resend_verification_email` mirroring `/forgot-password`'s
+pattern, plus 11 new tests (`tests/unit/test_email_provider_startup.py` ×7,
+`TestResendVerificationEmailConstantTimeGuarantee` ×4 in `test_timing_side_channel.py`). Both
+findings confirmed genuinely red before the fix (temporarily reverted, reran, restored). Full
+suite: 244 → **255/255 passed**, zero regressions. Gate 3 round 2: qa-engineer PASS (255/255,
+independently re-run, both new test groups confirmed substantive) + security-specialist CLOSED on
+both findings (empirically confirmed via subprocess `Settings()` cases, symmetric — no
+over-blocking of legitimate configs). **OBJ-005 clear to close.**
 
 ## OBJ-006 — Migrations & Supply Chain Hardening
 
@@ -175,7 +186,8 @@ with the user.
 - `b733c17` (2026-08-21) — OBJ-000+OBJ-001 full slice.
 - `33b7aa0` (2026-08-21) — OBJ-002 full slice.
 - `5ce5e2c` (2026-08-23) — OBJ-003 full slice.
-- All three pushed to `origin/main` (verified 2026-08-23, see `CLAUDE.md` commit+push discipline).
+- `bcd058f` (2026-08-25) — OBJ-004 full slice (Gate 3: qa-engineer + security-specialist both PASS).
+- All four pushed to `origin/main` (verified 2026-08-25, see `CLAUDE.md` commit+push discipline).
 
 ## Notes
 

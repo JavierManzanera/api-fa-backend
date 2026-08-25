@@ -25,13 +25,23 @@ async def create_user(
     email: str | None = None,
     password: str = DEFAULT_PASSWORD,
     is_active: bool = True,
-    is_verified: bool = False,
+    is_verified: bool = True,
 ):
     """Creates and persists a User with a real bcrypt hash of `password`.
 
     Returns (user, plaintext_password) since the plaintext is needed by
     tests that exercise /auth/login and is otherwise thrown away by the
     hash.
+
+    OBJ-005 (docs/testing/obj-005-test-report.md's flagged cross-cutting
+    risk, required non-optional carry-over): `is_verified` now defaults to
+    True, not False. Once /auth/login enforces is_verified, every
+    pre-OBJ-005 test across ~13 files that logs in via a bare
+    `user_factory(...)` call (never passing is_verified) would otherwise
+    start failing with 400 "Email not verified" instead of 200. Tests that
+    specifically need an UNVERIFIED user (this objective's own new test
+    files) all pass `is_verified=False` explicitly regardless of this
+    default.
     """
     user = User(
         email=email or _unique_email(),

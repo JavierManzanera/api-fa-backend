@@ -1,6 +1,6 @@
 from typing import Annotated, List, Union
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
-from pydantic import AnyHttpUrl, PostgresDsn, computed_field, field_validator
+from pydantic import AnyHttpUrl, PostgresDsn, computed_field, field_validator, model_validator
 from functools import lru_cache
 
 MIN_SECRET_KEY_LENGTH = 32
@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     # today's existing (unconfigured) behavior.
     TRUSTED_PROXY_COUNT: int = 0
 
+    # OBJ-005 (obj-005-design-notes.md section 4.5): which EmailSender
+    # implementation app.api.deps.get_email_sender() wires up. Safe default
+    # ("console" -- always works, never fails) matching LOG_LEVEL's
+    # convention, not POSTGRES_SSL_MODE/SECRET_KEY's fail-at-import
+    # convention -- a bad value here is an operational/delivery concern,
+    # not a security posture regression, so it fails at first USE (a
+    # NotImplementedError from the factory) rather than at startup.
+    EMAIL_PROVIDER: str = "console"
+    EMAIL_FROM: str = "noreply@example.com"
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
@@ -131,6 +141,31 @@ class Settings(BaseSettings):
                 f"{sorted(_VALID_POSTGRES_SSL_MODES)}, got {value!r}."
             )
         return value
+
+    # Gate 3 security finding (docs/security/audit-report.md, "Gate 3 --
+    # Verificacion OBJ-005", "[NUEVO - MEDIO] EMAIL_PROVIDER por defecto
+    # ('console') sin gate de entorno"): cross-field, so it must be a
+    # model_validator (not a single-field field_validator like SECRET_KEY/
+    # POSTGRES_SSL_MODE/ENVIRONMENT above) -- it needs to see both
+    # ENVIRONMENT and EMAIL_PROVIDER at once. Fail-closed at startup,
+    # matching this file's established convention for every other
+    # security-adjacent field: ConsoleEmailSender logs the full email body
+    # (always containing the OTP in plaintext by design) to stdout, which
+    # would reintroduce finding #10's exposure class the moment this
+    # template is deployed to production without an operator explicitly
+    # choosing a real EmailSender provider.
+    @model_validator(mode="after")
+    def validate_email_provider_not_console_in_production(self) -> "Settings":
+        if self.ENVIRONMENT == "production" and self.EMAIL_PROVIDER == "console":
+            raise ValueError(
+                "EMAIL_PROVIDER must not be 'console' when ENVIRONMENT is "
+                "'production' -- ConsoleEmailSender logs OTP codes in "
+                "plaintext to stdout, which reintroduces a closed security "
+                "exposure (audit-report.md finding #10) in production. "
+                "Configure a real EmailSender implementation and set "
+                "EMAIL_PROVIDER accordingly."
+            )
+        return self
 
     @computed_field
     @property

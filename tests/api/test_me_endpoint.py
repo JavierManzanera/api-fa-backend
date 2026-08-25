@@ -25,7 +25,10 @@ from app.core.config import settings
 async def test_me_returns_current_user_for_valid_access_token(
     client, api_prefix, user_factory
 ):
-    user, _ = await user_factory(email="frank@example.com")
+    # OBJ-005: user_factory's is_verified default flipped to True (see
+    # tests/factories.py's create_user docstring) -- pass is_verified=False
+    # explicitly here since this test asserts the unverified-response shape.
+    user, _ = await user_factory(email="frank@example.com", is_verified=False)
     token = security.create_access_token(user.email)
 
     resp = await client.get(

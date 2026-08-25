@@ -15,6 +15,8 @@ from app.core import rate_limit
 from app.core import audit_log
 from app.core import notifications
 from app.core.config import settings
+from app.core.email.base import EmailSender, EmailSendError
+from app.core.email.templates import render_verification_email
 from app.models.user import User
 from app.models.verification import Verification
 from app.models.refresh_session import RefreshSession
@@ -30,10 +32,33 @@ OTP_RESEND_COOLDOWN_SECONDS = 60
 FORGOT_PASSWORD_RATE_LIMIT_PER_MINUTE = 5
 VERIFY_OTP_RATE_LIMIT_PER_MINUTE = 10
 RESET_PASSWORD_RATE_LIMIT_PER_MINUTE = 10
+# Named constant, extracted from the inline `timedelta(minutes=10)` literal
+# that used to sit directly at the /forgot-password call site (design notes
+# section 1.2's flagged, non-blocking cleanup) -- makes both purposes' TTLs
+# equally discoverable here rather than one being named and one a magic
+# number.
+RESET_PASSWORD_OTP_TTL_MINUTES = 10
 
 RESET_PASSWORD_PURPOSE = "reset_password"
 GENERIC_OTP_SENT_MESSAGE = "If the email exists, an OTP has been sent."
 GENERIC_OTP_INVALID_MESSAGE = "Invalid or expired OTP"
+
+# OBJ-005 (obj-005-design-notes.md sections 1-2): email-verification reuses
+# the same Verification table/OTP mechanism as password reset, under its
+# own purpose value, TTL, rate limits, and generic messages -- see
+# _check_and_consume_otp's `purpose`/`max_attempts`/`invalid_message`
+# parameters below for how the two stay isolated.
+EMAIL_VERIFICATION_PURPOSE = "email_verification"
+EMAIL_VERIFICATION_OTP_TTL_MINUTES = 30
+VERIFY_EMAIL_RATE_LIMIT_PER_MINUTE = 10
+RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE = 5
+EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
+
+GENERIC_EMAIL_VERIFICATION_INVALID_MESSAGE = "Invalid or expired verification code"
+GENERIC_EMAIL_VERIFICATION_SENT_MESSAGE = (
+    "If the email exists and is not yet verified, a verification code has been sent."
+)
+UNVERIFIED_EMAIL_MESSAGE = "Email not verified"
 
 
 def _generate_otp() -> str:
@@ -42,16 +67,30 @@ def _generate_otp() -> str:
     return "".join(secrets.choice(string.digits) for _ in range(6))
 
 
-async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str, ip: str) -> Verification:
-    """Validates `otp` against the live `reset_password` Verification row for
-    `email`, sharing ONE failed-attempt budget between /verify-otp and
-    /reset-password (audit finding #2 -- design notes section 2).
+async def _check_and_consume_otp(
+    db: AsyncSession,
+    email: str,
+    otp: str,
+    ip: str,
+    *,
+    purpose: str = RESET_PASSWORD_PURPOSE,
+    max_attempts: int = MAX_OTP_ATTEMPTS,
+    invalid_message: str = GENERIC_OTP_INVALID_MESSAGE,
+) -> Verification:
+    """Validates `otp` against the live Verification row for `email`
+    scoped to `purpose`, sharing ONE failed-attempt budget between the two
+    endpoints of that same purpose (e.g. /verify-otp and /reset-password
+    for `reset_password`; /verify-email for `email_verification` -- audit
+    finding #2, generalized by OBJ-005 design notes section 1.1 so a
+    failed attempt against one purpose can never decrement another
+    purpose's budget for the same email: the `purpose` filter below is
+    what enforces that isolation).
 
-    - No live (unexpired) row at all -> generic 400, no state change (only
-      /forgot-password creates rows; nothing here should become a row-spam
-      vector).
+    - No live (unexpired) row for this (email, purpose) -> generic 400, no
+      state change (only the corresponding "request a code" endpoint
+      creates rows; nothing here should become a row-spam vector).
     - Live row, wrong code -> increments `attempts`; once it reaches
-      MAX_OTP_ATTEMPTS the row is invalidated (expires_at pulled to "now")
+      `max_attempts` the row is invalidated (expires_at pulled to "now")
       so it stops matching future "live row" lookups too. Same generic 400
       either way -- lockout, expiry, and wrong-code are indistinguishable
       by design (no new oracle). Every wrong guess emits
@@ -60,15 +99,15 @@ async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str, ip: str
       notes section 4.2 -- both attempt tracking and lockout are genuine
       audit-worthy events).
     - Live row, correct code -> returned to the caller to finish the
-      business flow (verify-otp just reports success; reset-password also
-      deletes it after use).
+      business flow (verify-otp just reports success; reset-password/
+      verify-email also delete it after use).
     """
-    generic_error = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=GENERIC_OTP_INVALID_MESSAGE)
+    generic_error = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=invalid_message)
 
     result = await db.execute(
         select(Verification).filter(
             Verification.email == email,
-            Verification.purpose == RESET_PASSWORD_PURPOSE,
+            Verification.purpose == purpose,
             Verification.expires_at > datetime.now(timezone.utc),
         )
     )
@@ -83,17 +122,17 @@ async def _check_and_consume_otp(db: AsyncSession, email: str, otp: str, ip: str
             "auth.otp.failed_attempt",
             email=email,
             ip=ip,
-            purpose=RESET_PASSWORD_PURPOSE,
+            purpose=purpose,
             attempts=verification.attempts,
         )
-        if verification.attempts >= MAX_OTP_ATTEMPTS:
+        if verification.attempts >= max_attempts:
             verification.expires_at = datetime.now(timezone.utc)
             audit_log.log_auth_event(
                 "auth.otp.lockout",
                 level=logging.WARNING,
                 email=email,
                 ip=ip,
-                purpose=RESET_PASSWORD_PURPOSE,
+                purpose=purpose,
             )
         await db.commit()
         raise generic_error
@@ -165,8 +204,20 @@ async def read_current_user(
 async def register(
     http_request: Request,
     user_in: UserCreate,
-    db: AsyncSession = Depends(deps.get_db)
+    db: AsyncSession = Depends(deps.get_db),
+    email_sender: EmailSender = Depends(deps.get_email_sender),
 ) -> Any:
+    """OBJ-005 (design notes section 2.3, Gate 1 decision 3): registration
+    now also generates an `email_verification` code and sends it via the
+    injected EmailSender. If the send fails, the ENTIRE registration is
+    rolled back (no User row, no Verification row survive) and the
+    endpoint returns 503 -- the user has no other path to receive the
+    code, so a half-created, unverifiable account must never exist.
+
+    Uses flush() (not commit()) for both inserts so a failed send can be
+    undone with a clean db.rollback() -- no compensating deletes, no
+    window where a partially-created user is externally visible.
+    """
     ip = rate_limit.client_ip(http_request)
     result = await db.execute(select(User).filter(User.email == user_in.email))
     user = result.scalars().first()
@@ -184,6 +235,31 @@ async def register(
         is_verified=False
     )
     db.add(user)
+    await db.flush()  # assigns user.id -- needed before the Verification row, no commit yet
+
+    otp = _generate_otp()
+    verification = Verification(
+        email=user.email,
+        code=security.hash_otp(otp),
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=EMAIL_VERIFICATION_OTP_TTL_MINUTES),
+    )
+    db.add(verification)
+    await db.flush()
+
+    subject, body = render_verification_email(otp)
+    try:
+        await email_sender.send(to=user.email, subject=subject, body=body)
+    except EmailSendError:
+        await db.rollback()  # undoes BOTH the User and the Verification insert -- same transaction
+        audit_log.log_auth_event(
+            "auth.register", email=user_in.email, ip=ip, outcome="email_send_failed"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registration could not be completed: the verification email could not be sent. Please try again.",
+        )
+
     await db.commit()
     await db.refresh(user)
     audit_log.log_auth_event("auth.register", email=user_in.email, ip=ip, outcome="success")
@@ -220,6 +296,18 @@ async def login(
             "auth.login.failure", email=form_data.username, ip=ip, reason="inactive_user"
         )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Inactive user")
+
+    # OBJ-005 (design notes section 3.2): distinguishable 400, extending
+    # the is_active check above by one predicate -- same accepted "business
+    # -state error, distinct from credential validation" category, not a
+    # new class of oracle. Positioned AFTER verify_password_or_dummy (finding
+    # #5's structural bcrypt-always guarantee), so bcrypt still runs exactly
+    # once per request regardless of account state.
+    if not user.is_verified:
+        audit_log.log_auth_event(
+            "auth.login.failure", email=form_data.username, ip=ip, reason="unverified_email"
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=UNVERIFIED_EMAIL_MESSAGE)
 
     new_family_id = uuid.uuid4()
     tokens = await _issue_tokens_and_session(db, user, family_id=new_family_id, jti=new_family_id)
@@ -290,7 +378,7 @@ async def forgot_password(
         email=payload.email,
         code=security.hash_otp(otp),
         purpose=RESET_PASSWORD_PURPOSE,
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=RESET_PASSWORD_OTP_TTL_MINUTES)
     )
     db.add(verification)
     await db.commit()
@@ -329,6 +417,169 @@ async def verify_otp(
     await _check_and_consume_otp(db, payload.email, payload.otp, ip)
 
     return {"msg": "OTP verified successfully"}
+
+
+@router.post("/verify-email", response_model=UserResponse)
+async def verify_email(
+    http_request: Request,
+    payload: OTPVerifyRequest,
+    db: AsyncSession = Depends(deps.get_db),
+) -> Any:
+    """OBJ-005 Story 1 (design notes section 2.1). Reuses OTPVerifyRequest
+    (same shape as /verify-otp) and _check_and_consume_otp, scoped to
+    purpose=email_verification -- its own shared-attempts budget, own TTL,
+    own generic error message (deliberately distinct from /verify-otp's,
+    per design notes section 2.1: no cross-endpoint oracle since the two
+    purposes never share a response).
+
+    On success: sets User.is_verified=True and DELETES the Verification
+    row (consume-and-delete, matching /reset-password's pattern, not
+    /verify-otp's check-without-consuming pattern) -- a replayed code then
+    falls into the ordinary "no live row" generic-400 branch, no special
+    -casing needed (Scenario 1.5). No tokens are issued (no auto-login);
+    the client calls /auth/login normally afterward.
+    """
+    ip = rate_limit.client_ip(http_request)
+    await rate_limit.enforce_rate_limit(
+        db,
+        scope="verify_email",
+        ip=ip,
+        email=payload.email,
+        limit=VERIFY_EMAIL_RATE_LIMIT_PER_MINUTE,
+    )
+
+    verification = await _check_and_consume_otp(
+        db,
+        payload.email,
+        payload.otp,
+        ip,
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+        invalid_message=GENERIC_EMAIL_VERIFICATION_INVALID_MESSAGE,
+    )
+
+    result = await db.execute(select(User).filter(User.email == payload.email))
+    user = result.scalars().first()
+    if not user:
+        # Unreachable in practice (a live email_verification row implies a
+        # User row was created alongside it, atomically, by /register) --
+        # same generic message as any other invalid code, no new oracle.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=GENERIC_EMAIL_VERIFICATION_INVALID_MESSAGE
+        )
+
+    user.is_verified = True
+    await db.delete(verification)
+    await db.commit()
+    await db.refresh(user)
+    audit_log.log_auth_event("auth.email_verified", email=user.email, ip=ip, user_id=str(user.id))
+    return user
+
+
+@router.post("/resend-verification-email")
+async def resend_verification_email(
+    http_request: Request,
+    payload: EmailRequest,
+    db: AsyncSession = Depends(deps.get_db),
+    email_sender: EmailSender = Depends(deps.get_email_sender),
+) -> Any:
+    """OBJ-005 Story 1 (design notes section 2.2). Mirrors /forgot-password
+    almost line for line: unauthenticated, always the same generic 200
+    (anti-enumeration -- never reveals whether the email exists), per
+    -email rate limiting, resend cooldown that preserves rather than
+    rotates a still-fresh code.
+
+    One addition /forgot-password doesn't need: an already-verified user's
+    resend is a silent no-op (no new row, no email attempt) -- both an
+    anti-oracle property and avoids spamming an already-verified inbox.
+    """
+    ip = rate_limit.client_ip(http_request)
+    await rate_limit.enforce_rate_limit(
+        db,
+        scope="resend_verification_email",
+        ip=ip,
+        email=payload.email,
+        limit=RESEND_VERIFICATION_RATE_LIMIT_PER_MINUTE,
+    )
+
+    result = await db.execute(select(User).filter(User.email == payload.email))
+    user = result.scalars().first()
+
+    # Gate 3 security finding (audit-report.md, "Gate 3 -- Verificacion
+    # OBJ-005", "[NUEVO - MEDIO] /auth/resend-verification-email sin la
+    # mitigacion de timing de finding #5"): mirrors /forgot-password's
+    # unconditional bcrypt-dummy tax exactly -- called BEFORE either early
+    # return below, so response cost can't be used to distinguish "email
+    # doesn't exist" / "email exists and already verified" (both take the
+    # fast path) from "email exists and unverified" (the slow path with
+    # extra queries/writes/email send). This endpoint never checks a real
+    # password, so the target is always DUMMY_PASSWORD_HASH, same as
+    # /forgot-password.
+    security.verify_password_or_dummy(payload.email, None)
+
+    if not user or user.is_verified:
+        return {"msg": GENERIC_EMAIL_VERIFICATION_SENT_MESSAGE}
+
+    # Resend cooldown (mirrors /forgot-password's identical block): a row
+    # created within the last EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS is
+    # left alone, whether still usable or already locked out -- stops an
+    # attacker who just burned their attempt budget from immediately
+    # resetting it via a resend. Same generic 200 either way.
+    existing_result = await db.execute(
+        select(Verification)
+        .filter(
+            Verification.email == payload.email,
+            Verification.purpose == EMAIL_VERIFICATION_PURPOSE,
+        )
+        .order_by(Verification.created_at.desc())
+    )
+    existing = existing_result.scalars().first()
+    if existing is not None:
+        cooldown_cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS
+        )
+        if existing.created_at is not None and existing.created_at > cooldown_cutoff:
+            return {"msg": GENERIC_EMAIL_VERIFICATION_SENT_MESSAGE}
+
+    # Rotate: invalidate any previous email-verification codes for this
+    # email and issue a fresh one.
+    await db.execute(
+        delete(Verification).where(
+            Verification.email == payload.email,
+            Verification.purpose == EMAIL_VERIFICATION_PURPOSE,
+        )
+    )
+
+    otp = _generate_otp()
+    verification = Verification(
+        email=payload.email,
+        code=security.hash_otp(otp),
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=EMAIL_VERIFICATION_OTP_TTL_MINUTES),
+    )
+    db.add(verification)
+    await db.commit()
+
+    audit_log.log_auth_event(
+        "auth.email_verification.resend_requested",
+        email=payload.email,
+        ip=ip,
+        purpose=EMAIL_VERIFICATION_PURPOSE,
+    )
+
+    # A resend's send failure does NOT get /register's "roll back and fail
+    # loudly" treatment (design notes section 2.2 step 6) -- there is no
+    # create-then-orphan risk here (the User row and the freshly-rotated
+    # Verification row both already exist regardless of send outcome), and
+    # /forgot-password's own anti-enumeration contract already tolerates
+    # this same "we said we sent it" trust model. Still the same generic
+    # 200 either way.
+    subject, body = render_verification_email(otp)
+    try:
+        await email_sender.send(to=payload.email, subject=subject, body=body)
+    except EmailSendError:
+        pass
+
+    return {"msg": GENERIC_EMAIL_VERIFICATION_SENT_MESSAGE}
 
 
 @router.post("/reset-password")
@@ -448,6 +699,15 @@ async def refresh_token(
     if not user or not user.is_active:
         audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="user_inactive")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User inactive or not found")
+
+    # OBJ-005 (design notes section 3.2): same predicate, same status
+    # family as /login's check above -- piggybacks on the User row already
+    # loaded, no extra query. Runs fresh against the DB on every refresh,
+    # never baked into a JWT claim (Scenario 2.A.3's "auditing gate, not
+    # re-verification" framing).
+    if not user.is_verified:
+        audit_log.log_auth_event("auth.refresh.failure", ip=ip, reason="unverified_email")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=UNVERIFIED_EMAIL_MESSAGE)
 
     if payload.get("ver") != user.token_version:
         # Password-reset invalidation (design notes section 3).
