@@ -131,11 +131,18 @@ hold for a genuine greenfield DB, worth a `database-architect` look before a rea
 
 ## OBJ-007 — Registration Enumeration Policy Decision
 
-Status: Gate 1 done, entering Phase 2 (qa-engineer red-phase tests next) | Agent chain:
-solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | Blocked by: none
-| Traces to: audit-report.md #6
+Status: Gate 2 PASSED (red-phase tests written + live-confirmed genuinely red) — awaiting user
+approval to proceed to developer implementation | Agent chain: solution-architect → qa-engineer →
+developer → qa-engineer ∥ security-specialist | Blocked by: none | Traces to: audit-report.md #6
 Docs: design=`docs/api/obj-007-design-notes.md` · spec=`docs/api/openapi.yaml` (`/auth/register`
-path)
+path) · tests=`docs/testing/obj-007-test-report.md`
+Gate 2 (qa-engineer, commits `8418e00`+`87d783d`): 17 tests across
+`test_register_email_verification.py` / `test_timing_side_channel.py` /
+`test_audit_logging.py`, live-run against real Postgres 2026-08-25 — 14 failed / 3 passed (the 3
+green ones are pre-existing regression anchors untouched by this objective). All 14 failures
+confirmed as clean contract mismatches (`201`/`400` vs. the new `200`/`503` contract), none from
+typos/fixtures/imports. One test-authoring bug found+fixed during the live pass (a post-rollback
+ORM-attribute read causing a crash instead of a clean assertion failure).
 Gate 1 decision (2026-08-25, user): switch `/register` to a generic anti-enumeration response
 matching `/forgot-password`'s pattern.
 Gate 1 design (solution-architect): new contract is `200` + `MessageResponse` (same body whether
@@ -147,8 +154,8 @@ sends a "you already have an account" notification via `EmailSender`, creates ze
 `User`/`Verification` rows, and its send-failure also yields `503` (closes a residual oracle).
 Flagged for Gate 3, not blocking now: `/register` still has no rate limiting (existing gap, out of
 this objective's scope).
-Open items: qa-engineer red-phase tests, then developer implementation, then Gate 3.
-Commit: not yet pushed (branch `obj-007-register-anti-enumeration`)
+Open items: user Gate 2 approval, then developer implementation, then Gate 3.
+Commit: `8418e00`, `87d783d` (branch `obj-007-register-anti-enumeration`, not yet merged)
 
 ## Commits
 
