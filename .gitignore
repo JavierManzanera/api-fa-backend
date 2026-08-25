@@ -27,6 +27,9 @@ build/
 .coverage
 htmlcov/
 
+# Disposable local test Postgres (initdb/pg_ctl pattern, no Docker on this machine)
+.pgdata-test*/
+
 # Alembic
 alembic/versions/*.pyc
 

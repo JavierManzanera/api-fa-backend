@@ -174,17 +174,11 @@ with the user.
 
 ## Finding #15 remediation — `ALGORITHM` config guardrail
 
-Status: In progress (developer dispatched next) | Agent chain: security-specialist → developer →
-qa-engineer | Branch: `security-finding-15-algorithm-guardrail`
+Status: CLOSED (commit `b97f9a5`, live-verified 267/267 green on `tests/unit`+`tests/api` 2026-08-25
+— not yet merged, awaiting PR review) | Agent chain: security-specialist → developer → qa-engineer
 Docs: security=`audit-report.md` §"Auditoría puntual — PYSEC-2026-1325 / python-ecdsa / ALGORITHM
-sin validar (2026-08-25)" (new finding #15, MEDIUM)
-Context: CI's `pip-audit` suppresses `PYSEC-2026-1325` (unfixed side-channel advisory in
-`python-ecdsa`, pulled in transitively/unconditionally by `python-jose`). security-specialist
-confirmed runtime exposure is genuinely zero today (HS256-only in practice, and `python-jose`
-prefers the `cryptography`/OpenSSL backend over pure-Python `ecdsa` whenever available, which it
-always is here) — but `ALGORITHM` has zero validation in `app/core/config.py`, unlike every other
-security-adjacent `Settings` field, so "HS256-only" is an observed fact, not an enforced invariant.
-Fix: add a `field_validator` restricting `ALGORITHM` to `{"HS256"}`, same pattern as
+sin validar (2026-08-25)" (finding #15, MEDIUM)
+Fail-closed `field_validator` on `Settings.ALGORITHM` restricting it to `{"HS256"}`, same pattern as
 `POSTGRES_SSL_MODE`/`ENVIRONMENT`. User approved doing this now (2026-08-25); durable fix (dropping
 `python-jose` entirely) tracked separately as OBJ-008 backlog.
 
