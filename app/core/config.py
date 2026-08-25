@@ -118,6 +118,17 @@ class Settings(BaseSettings):
     # posture), same convention as TRUSTED_PROXY_COUNT/LOG_LEVEL above.
     RATE_LIMIT_IP_MULTIPLIER: int = 5
 
+    # OBJ-014 (obj-014-design-notes.md section 2/3): size of the reserved
+    # "fresh IP only" slot pool carved out of the tail end of each scope's
+    # existing email-keyed `limit` -- NOT an additional budget on top of
+    # `limit`, a restriction on who may spend the last `reserved` units of the
+    # existing one. Closes audit finding #20 (a single attacking IP could
+    # otherwise exhaust a victim's whole email-keyed budget alone). Default 1
+    # is deliberately small -- see design notes section 6 for why this exact
+    # value needs user sign-off before changing, same posture as
+    # RATE_LIMIT_IP_MULTIPLIER.
+    RATE_LIMIT_EMAIL_RESERVED_SLOTS: int = 1
+
     # OBJ-005 (obj-005-design-notes.md section 4.5): which EmailSender
     # implementation app.api.deps.get_email_sender() wires up. Safe default
     # ("console" -- always works, never fails) matching LOG_LEVEL's
@@ -197,6 +208,44 @@ class Settings(BaseSettings):
                 "supported by this template's validated configuration surface "
                 "-- see audit-report.md finding #15 / OBJ-008 before enabling "
                 "one."
+            )
+        return value
+
+    # Security audit finding #21 (docs/security/audit-report.md, "Gate 3 --
+    # Verificacion OBJ-013" section 3b): a 0 or negative multiplier makes
+    # `resolved_ip_limit` (rate_limit.py) 0 or negative, and a COUNT() result is
+    # never negative -- `ip_hits.scalar_one() >= resolved_ip_limit` becomes
+    # unconditionally true, self-denying the FIRST request from ANY IP on ALL 6
+    # rate-limited endpoints. Not attacker-reachable (this is a deploy-time
+    # setting, not request input) but a cheap fail-closed guardrail, same
+    # posture as every other validated field in this class.
+    @field_validator("RATE_LIMIT_IP_MULTIPLIER")
+    @classmethod
+    def validate_rate_limit_ip_multiplier(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError(
+                f"RATE_LIMIT_IP_MULTIPLIER must be >= 1, got {value!r}. A value "
+                "of 0 or negative makes the IP-keyed rate limit unreachable "
+                "(0) or nonsensical (negative), which self-denies every request "
+                "on all 6 rate-limited endpoints -- see audit-report.md finding #21."
+            )
+        return value
+
+    # OBJ-014 (obj-014-design-notes.md section 7): proactive validator for
+    # the new RATE_LIMIT_EMAIL_RESERVED_SLOTS setting, same fail-closed
+    # posture as RATE_LIMIT_IP_MULTIPLIER above -- added alongside it so it
+    # doesn't become a future finding of the same shape. 0 is a legitimate,
+    # explicit opt-out (disables the reserved-fresh-IP-slot mitigation,
+    # design notes section 6); negative has no defined meaning.
+    @field_validator("RATE_LIMIT_EMAIL_RESERVED_SLOTS")
+    @classmethod
+    def validate_rate_limit_email_reserved_slots(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(
+                f"RATE_LIMIT_EMAIL_RESERVED_SLOTS must be >= 0, got {value!r}. "
+                "0 explicitly disables the reserved-fresh-IP-slot mitigation "
+                "(obj-014-design-notes.md section 2/6) and is allowed; a "
+                "negative value has no defined meaning."
             )
         return value
 
