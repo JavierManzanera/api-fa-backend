@@ -43,6 +43,12 @@ login/forgot-password/logout rather than re-litigating it:
     None)`), the target hash is DUMMY_PASSWORD_HASH in BOTH branches
     (found or not) -- /forgot-password never verifies a real password, so
     unlike /login there is no "existing user -> real hash" branch here.
+  - "/auth/register (OBJ-007, obj-007-design-notes.md section 3): both
+    branches must call security.get_password_hash exactly once (bcrypt
+    HASH, not verify -- register's real cost driver)." ->
+    TestRegisterConstantTimeGuarantee. Unlike every other class here, this
+    endpoint has no dummy-vs-real "target hash" distinction to assert --
+    only the call-count property.
   - "/auth/logout with an invalid/unsigned token: assert db.execute and
     db.commit are each called exactly once (matching the valid-jti
     branch's call counts), not zero times." -> TestLogoutConstantTimeGuarantee.
@@ -335,6 +341,76 @@ class TestResendVerificationEmailConstantTimeGuarantee:
             "never verify against a real user's hashed_password (no "
             "password is being checked here at all, only padding the "
             "response cost)"
+        )
+
+
+class TestRegisterConstantTimeGuarantee:
+    """OBJ-007 (obj-007-design-notes.md section 3, closes audit finding
+    #6's residual timing dimension): /auth/register's real cost driver is
+    a bcrypt HASH (security.get_password_hash), not a verify -- unlike
+    every other class in this file, there is no "target hash" to compare
+    (get_password_hash always hashes whatever password it's given; it
+    has no dummy-vs-real distinction the way verify_password_or_dummy
+    does). The property under test is simply: BOTH branches call it
+    exactly once, so a duplicate-email registration is not measurably
+    cheaper than a new-account one.
+
+    Design notes section 3 offers two implementation options for the
+    duplicate branch: (a) call security.get_password_hash(user_in.password)
+    unconditionally (recommended, and what this class tests), or (b) add a
+    separate dummy-hash helper. If `developer` takes option (b) instead,
+    these two tests need updating to patch that helper instead of
+    get_password_hash -- see docs/testing/obj-007-test-report.md for this
+    call-out.
+
+    DELIBERATE, per this file's established convention (see module
+    docstring): no wall-clock timing assertions -- call-count/spy
+    assertions only. A live timing measurement was considered and
+    deliberately skipped as typically too flaky for CI; the structural
+    guarantee (the call happens, unconditionally, exactly once, on both
+    branches) is the testable proxy, same rationale as every other class
+    above.
+    """
+
+    async def test_register_with_new_email_calls_get_password_hash_once(
+        self, client, api_prefix
+    ):
+        with patch(
+            "app.core.security.get_password_hash", wraps=security.get_password_hash
+        ) as mock_hash:
+            resp = await client.post(
+                f"{api_prefix}/auth/register",
+                json={"email": "timing-register-new@example.com", "password": "ValidPass123!"},
+            )
+
+        assert resp.status_code == 200
+        assert mock_hash.call_count == 1, (
+            "the new-account branch must call security.get_password_hash "
+            "exactly once (the real hash it has always needed) -- was "
+            f"called {mock_hash.call_count} time(s)"
+        )
+
+    async def test_register_with_duplicate_email_calls_get_password_hash_once(
+        self, client, api_prefix, user_factory
+    ):
+        user, _ = await user_factory(email="timing-register-dup@example.com")
+
+        with patch(
+            "app.core.security.get_password_hash", wraps=security.get_password_hash
+        ) as mock_hash:
+            resp = await client.post(
+                f"{api_prefix}/auth/register",
+                json={"email": user.email, "password": "AnotherValid123!"},
+            )
+
+        assert resp.status_code == 200
+        assert mock_hash.call_count == 1, (
+            "the duplicate-email branch must ALSO call "
+            "security.get_password_hash exactly once (design notes "
+            "section 3's timing-parity requirement) -- otherwise the "
+            "found/not-found asymmetry the fix targets would just move "
+            "rather than close. Today's code has no bcrypt-hash call "
+            "anywhere on this branch at all."
         )
 
 

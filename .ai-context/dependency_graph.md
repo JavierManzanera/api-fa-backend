@@ -33,8 +33,8 @@ a specific finding number — read the cited finding, don't trust a one-line par
    ├── [OBJ-005] Email Verification Flow (MEDIUM)
    └── [OBJ-006] Migrations & Supply Chain Hardening (LOW)
 
-[OBJ-007] Registration Enumeration Policy Decision (LOW) — blocked on a product decision from the
-user, not on any other objective's code.
+[OBJ-007] Registration Enumeration Policy Decision (LOW) — CLOSED 2026-08-25 (Gate 3 unanimous
+PASS, PR pending merge).
 
 [OBJ-008] Replace python-jose with PyJWT[cryptography] (LOW, backlog) — removes the ecdsa
 dependency (and its suppressed CVE) from the tree entirely, not urgent.
@@ -51,8 +51,9 @@ dependency (and its suppressed CVE) from the tree entirely, not urgent.
 | OBJ-004 | CORS; security headers; `ENVIRONMENT`-gated docs; audit logging; remove OTP debug print; XFF-aware `client_ip()` | solution-architect → qa-engineer → developer | **CLOSED** (commit `bcd058f`) | audit-report.md #9, #10, #13 |
 | OBJ-005 | Real `/verify-email` flow; `is_verified` enforcement at login/refresh; `EmailSender` abstraction | business-analyst → solution-architect → qa-engineer → developer | **CLOSED** (commit `8ea1294`) | audit-report.md #11 |
 | OBJ-006 | Real Alembic migrations; DDL/DML role separation; dependency pinning/CI audit; scheduled cleanup jobs | database-architect → devops-engineer | **CLOSED** (`c4c518b` + PR #1 merge `2bc6eb6`) | audit-report.md #12, #14 |
-| OBJ-007 | Decide `/register` enumeration behavior (explicit vs. generic) | **user decision required**, then developer | Not Started (blocked on product decision) | audit-report.md #6 |
-| — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | In progress (developer next) | audit-report.md #15 |
+| OBJ-007 | `/register` switches to generic anti-enumeration response (matches `/forgot-password`) | solution-architect → qa-engineer → developer → qa-engineer ∥ security-specialist | **CLOSED** (PR pending) | audit-report.md #6 |
+| — | `/register` DoS amplification via missing rate limit (finding #16) | security-specialist found it | Not Started (backlog) | audit-report.md §Gate 3 OBJ-007 |
+| — | `ALGORITHM` config guardrail (finding #15) | security-specialist → developer → qa-engineer | **CLOSED** (PR #4 merged) | audit-report.md #15 |
 | OBJ-008 | Replace `python-jose` with `PyJWT[cryptography]` (drops `ecdsa`/PYSEC-2026-1325 entirely) | developer → qa-engineer ∥ security-specialist | Not Started (backlog, LOW, no deadline) | audit-report.md #15 |
 
 ## OBJ-000 — Test Infrastructure Bootstrap
@@ -125,57 +126,42 @@ fixed same pass, both independently re-confirmed CLOSED.
 
 ## OBJ-006 — Migrations & Supply Chain Hardening
 
-Status: CLOSED (`c4c518b` direct-to-main under the old policy + PR #1 / merge `2bc6eb6` under the
-new one) | Agent chain: database-architect → devops-engineer → developer (RateLimitHit.ip fix) →
-devops-engineer (CI YAML fix)
-Docs: plan+migrations+handoff=`docs/database/obj-006-migration-plan.md` (includes the Gate 1
-approval, migration-authorship, and devops addendum sections)
-devops-engineer delivered: `.github/workflows/ci.yml` (4 jobs, all now correctly named — a job
-`name:` containing an unquoted ` #` was silently truncated by YAML comment parsing, caught when it
-broke a required branch-protection status check, fixed in `f930513`) · pinned
-`requirements(-dev).txt` + `requirements(-dev).lock.txt` (finding #12) · `pip-audit` wired ·
-`app/core/scheduler.py` (APScheduler cleanup jobs) · CI role-separation smoke test (finding #14).
-Every CI migration step targets `0007` explicitly, never `head`/`0008`.
-`RateLimitHit.ip` ORM/migration-drift fix (model was `String`, migration 0006 casts DB column to
-`INET`) — closed, both modes 255/255 green, confirmed on real CI too.
-**Commit+push policy change (2026-08-25, mid-objective) — this is the objective where it happened:**
-`c4c518b` (CI pipeline etc.) landed direct-to-`main` under the *old* policy; the
-`RateLimitHit.ip`/YAML fixes that followed went through the *new* one (branch
-`obj-006-migrations-supply-chain` → PR #1 → user-reviewed-and-merged on GitHub, `2bc6eb6`) — see
-`CLAUDE.md` directive #4 for the full policy and reasoning. GitHub branch protection on `main` is
-now live and verified (direct push tested and rejected with `GH006`).
-Secondary, lower-urgency, not yet actioned: `docs/database/sql/provision_db_roles.sql`'s DML
-grants assume the 4 tables already exist, doesn't hold for a genuine greenfield DB — CI works
-around it with a narrower bootstrap subset; real operator script may need the same split for an
-actual staging/production cutover.
-Gate 1 decisions (APPROVED 2026-08-23): `rate_limit_hits` retention 1hr · `refresh_sessions`
-retention floor = 7 days (`REFRESH_TOKEN_EXPIRE_DAYS`, hard floor, not adjustable downward) ·
-cleanup scheduler = APScheduler over `pg_cron` · migration 0005 (timestamp convergence) kept ·
-**migration 0006 (`RateLimitHit.ip`→`INET`) INCLUDED** — user explicitly accepted the data-cast
-risk rather than deferring it · CI role-separation enforcement adopted · optional partial-unique-
-index defense (migration 0008) adopted.
-**CRITICAL, blocking further deployment**: migration `0008` (partial unique index on
-`refresh_sessions.family_id`) is confirmed **deterministically incompatible** with the current
-`/auth/refresh` rotation handler's insert-then-revoke ordering — breaks every single-threaded
-rotation once migrated to head. Validated fix (reorder to revoke→insert→link) documented in the
-migration plan doc. **Do not run `alembic upgrade head` — stop at `0007` — until `developer`
-reorders that handler.**
-`greenlet` blocker (see Notes) confirmed resolved 2026-08-25 — full suite now verified in both
-modes: create_all = 255/255 green; `TEST_DB_SCHEMA_SOURCE=alembic` (stopping at 0007) = 60 failing,
-all traced to the single `RateLimitHit.ip` type-mismatch finding above, not a migration-authorship
-defect. Awaiting user decision on the finding above before OBJ-006 fully closes.
+Status: CLOSED (`c4c518b` + PR #1 merge `2bc6eb6`; follow-ups `bae2915` RateLimitHit.ip fix,
+`f930513` CI YAML quoting fix, `25d5792`/PR #3 alembic-gate made required)
+Docs: plan+migrations+handoff=`docs/database/obj-006-migration-plan.md` · security=`audit-report.md`
+#12, #14
+Residual, not yet actioned: migration `0008` (partial unique index on `refresh_sessions.family_id`)
+still confirmed incompatible with `/auth/refresh`'s current handler ordering — CI stays pinned to
+`0007` until `developer` reorders it (see migration-plan doc, "CRITICAL finding"). Also
+`docs/database/sql/provision_db_roles.sql`'s DML-grant block assumes tables already exist — doesn't
+hold for a genuine greenfield DB, worth a `database-architect` look before a real prod cutover.
 
 ## OBJ-007 — Registration Enumeration Policy Decision
 
-Status: Not Started, blocked on a product decision (not code) | Traces to: audit-report.md #6
-Decide: keep `/register`'s explicit "email already exists" `400` (documented accepted risk) vs.
-switch to a generic response matching `/forgot-password`'s anti-enumeration pattern. Not yet raised
-with the user.
+Status: CLOSED — Gate 3 unanimous PASS (qa-engineer 262/262 live, security-specialist finding #6
+confirmed closed by code reading not self-report) — commits `4182d8b`..`7f718c8` on branch
+`obj-007-register-anti-enumeration`, not yet merged (PR pending)
+Docs: design=`docs/api/obj-007-design-notes.md` · spec=`docs/api/openapi.yaml` (`/auth/register`) ·
+tests=`docs/testing/obj-007-test-report.md` · security=`audit-report.md` §"Gate 3 — Verificación
+OBJ-007"
+`POST /register` now returns identical `200`+`MessageResponse` whether the email is new or already
+registered — no `User`/`Verification` row, no distinguishable timing (unconditional
+`get_password_hash()`), symmetric `503` on send-failure, on the duplicate-email branch.
+
+## Finding #16 (new, MEDIUM, non-blocking) — `/register` DoS amplification via missing rate limit
+
+Status: Not started, backlog | Traces to: audit-report.md §"Gate 3 — Verificación OBJ-007"
+Found by security-specialist during OBJ-007 Gate 3: `/register` still has no `enforce_rate_limit`
+call (pre-existing gap), and OBJ-007's own timing-parity fix now makes the duplicate-email branch
+pay a real bcrypt cost too (previously near-free) — the one remaining unauthenticated auth endpoint
+with no rate limiting just got a genuine CPU-exhaustion amplification vector. Not urgent enough to
+block OBJ-007's Gate 3, but real. Candidate for a dedicated small objective or folding into
+whichever next touches `/register`.
 
 ## Finding #15 remediation — `ALGORITHM` config guardrail
 
 Status: CLOSED (commit `b97f9a5`, live-verified 267/267 green on `tests/unit`+`tests/api` 2026-08-25
-— not yet merged, awaiting PR review) | Agent chain: security-specialist → developer → qa-engineer
+— PR #4 merged) | Agent chain: security-specialist → developer → qa-engineer
 Docs: security=`audit-report.md` §"Auditoría puntual — PYSEC-2026-1325 / python-ecdsa / ALGORITHM
 sin validar (2026-08-25)" (finding #15, MEDIUM)
 Fail-closed `field_validator` on `Settings.ALGORITHM` restricting it to `{"HS256"}`, same pattern as

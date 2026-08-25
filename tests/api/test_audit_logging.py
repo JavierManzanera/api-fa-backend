@@ -93,14 +93,22 @@ class TestRegisterEvent:
     """design notes section 4.2: auth.register, INFO, emitted from
     `register`, fields email/ip/outcome (success|duplicate). Beyond
     finding #10's literal list but a deliberate, non-Gate-1 addition
-    (design notes section 4.2's own note)."""
+    (design notes section 4.2's own note).
+
+    UPDATED by OBJ-007 (obj-007-design-notes.md section 2, 'Audit logging
+    is exempt from the anti-enumeration constraint'): the HTTP response
+    codes below changed (both branches now return 200, per
+    tests/api/test_register_email_verification.py), but the internal
+    audit-log outcome distinction (success vs. duplicate) is explicitly
+    preserved unchanged -- these are internal-only observability, not part
+    of the HTTP contract."""
 
     async def test_successful_registration_logs_success_outcome(self, client, api_prefix, caplog):
         resp = await client.post(
             f"{api_prefix}/auth/register",
             json={"email": "audit-register-new@example.com", "password": "ValidPass123!"},
         )
-        assert resp.status_code == 201
+        assert resp.status_code == 200
 
         events = _audit_events(caplog, "auth.register")
         assert len(events) == 1
@@ -115,7 +123,11 @@ class TestRegisterEvent:
             f"{api_prefix}/auth/register",
             json={"email": user.email, "password": "AnotherValid123!"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 200, (
+            "OBJ-007: the duplicate branch's HTTP response is now 200, "
+            "identical to the success branch -- only the internal audit "
+            "log (asserted below) still distinguishes the outcome"
+        )
 
         events = _audit_events(caplog, "auth.register")
         assert len(events) == 1

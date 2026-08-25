@@ -20,12 +20,20 @@ info:
     a real `POST /auth/verify-email` + `POST /auth/resend-verification-email`,
     `is_verified` enforcement at `/auth/login` and `/auth/refresh`, and a pluggable
     `EmailSender` abstraction replacing the print-based mock — closes audit finding
-    #11). Config/startup-only or transport-layer requirements that have no
-    HTTP surface (SECRET_KEY validation, PostgreSQL TLS enforcement, CORS/security-
-    headers middleware, environment gating, audit logging, `EmailSender` provider
-    selection) are intentionally NOT modeled here — see `docs/api/obj-001-design-
+    #11), plus the OBJ-007 remediation surface (registration anti-enumeration:
+    `POST /auth/register` no longer returns a distinguishable `400` for an
+    already-registered email — it now always returns the same generic `200`/
+    `MessageResponse` shape used by `/auth/forgot-password` and
+    `/auth/resend-verification-email`, closes audit finding #6). Config/startup-only
+    or transport-layer requirements that have no HTTP surface (SECRET_KEY
+    validation, PostgreSQL TLS enforcement, CORS/security-headers middleware,
+    environment gating, audit logging, `EmailSender` provider selection, and —
+    as of OBJ-007 — the server-side "you already have an account" notification
+    email and the bcrypt-cost timing-parity requirement on `/auth/register`) are
+    intentionally NOT modeled here — see `docs/api/obj-001-design-
     notes.md` §4, `docs/api/obj-003-design-notes.md` §2, `docs/api/obj-004-design-
-    notes.md` (full document), and `docs/api/obj-005-design-notes.md` (full document).
+    notes.md` (full document), `docs/api/obj-005-design-notes.md` (full document),
+    and `docs/api/obj-007-design-notes.md` (full document).
     Session/token persistence design (the `refresh_sessions` table, reuse-detection
     state machine, `token_version` claim) is documented in
     `docs/api/obj-002-design-notes.md`. **Note on finding numbers:** `obj-003-design-
@@ -37,7 +45,7 @@ info:
     independently verified against `audit-report.md` and found correct, no transposition
     (`obj-004-design-notes.md` §0). OBJ-005's #11 citation was independently verified
     against `audit-report.md` and found correct (`obj-005-design-notes.md` §0).
-  version: "0.6.0-obj-005"
+  version: "0.7.0-obj-007"
   contact:
     name: solution-architect (PRJ-003)
 servers:
@@ -60,25 +68,46 @@ paths:
     post:
       operationId: registerUser
       tags: [auth]
-      summary: Create a new user account
+      summary: Register — or, if the email is already registered, silently notify its owner
       description: >-
-        Enumeration behavior (explicit `400` on an existing email) unchanged by
-        OBJ-001 — a known, separately-tracked decision (OBJ-007), not part of any
-        other objective's scope.
+        **Changed by OBJ-007 (Gate 1 decision, 2026-08-25; closes audit finding #6).**
+        Response shape and status code are now IDENTICAL regardless of whether
+        `user_in.email` was already registered — the explicit `400` this endpoint
+        used to return for a duplicate email is gone. This mirrors
+        `/auth/forgot-password` and `/auth/resend-verification-email` exactly: a
+        generic `200`/`MessageResponse`, chosen for consistency per
+        `obj-007-design-notes.md` §1 rather than inventing a third response
+        pattern. Because the response body can no longer safely carry the created
+        user's actual data (returning it only on the new-account branch would
+        itself be the distinguishing signal), this endpoint **no longer returns
+        `UserResponse`/`201`** — that would have required either leaking real
+        account state on the duplicate-email branch or fabricating fake user data,
+        both rejected. See `obj-007-design-notes.md` §1 for the full rationale.
 
-        **Changed by OBJ-005 (finding #11).** On success, this endpoint now also
-        generates a 6-digit `purpose="email_verification"` `Verification` row
-        (same OTP/HMAC-at-rest mechanism as password-reset OTPs — see
-        `obj-005-design-notes.md` §1) and sends it via the injected `EmailSender`
-        (§4) **before** committing. Response shape and status code (`201`,
-        `UserResponse`, `is_verified: false`) are unchanged — Scenario 1.1's AC
-        forbids leaking the code/token in this response body.
+        Branch behavior (server-side only — never signaled in the HTTP response):
 
-        **New failure mode (Gate 1 decision 3, strict):** if the verification
-        email cannot be sent, the entire registration is rolled back — no `User`
-        row and no `Verification` row survive — and the call fails `503`. See
-        `obj-005-design-notes.md` §2.3 for the transaction-boundary mechanism
-        (`flush()` before the send attempt, `rollback()` on failure).
+        - **New email:** unchanged from OBJ-005 — a `User` row and a
+          `purpose="email_verification"` `Verification` row are created, and a
+          verification-code email is sent via the injected `EmailSender`.
+        - **Already-registered email:** no `User`/`Verification` row is created or
+          modified (still true, unchanged). Instead, an "already have an account"
+          notification email is sent to that address via the same `EmailSender`
+          — **not** a new verification code. See `obj-007-design-notes.md` §2.
+
+        **Timing/cost parity (OBJ-007, `obj-007-design-notes.md` §3):** both
+        branches must perform one bcrypt-cost operation and one outbound
+        `EmailSender.send()` call before responding, so wall-clock response time
+        does not distinguish "account created" from "email already registered" —
+        the same principle `/auth/login` and `/auth/forgot-password` already apply
+        via `security.verify_password_or_dummy` (see `obj-003-design-notes.md` §3.2),
+        extended here to registration's bcrypt-hash (not bcrypt-verify) cost.
+
+        **Failure mode (extends OBJ-005's Gate 1 decision 3 to both branches):** if
+        the required outbound email fails to send on EITHER branch, the call fails
+        `503` with an identical, branch-agnostic body. New-account branch: the
+        entire registration is rolled back (no `User`/`Verification` row survives).
+        Existing-account branch: nothing to roll back (no rows were ever created).
+        See `obj-007-design-notes.md` §3.
       requestBody:
         required: true
         content:
@@ -86,33 +115,31 @@ paths:
             schema:
               $ref: '#/components/schemas/UserCreate'
       responses:
-        '201':
-          description: User created; a verification code has been emailed
+        '200':
+          description: >-
+            Always returned regardless of whether `user_in.email` was already
+            registered (anti-enumeration — OBJ-007, closes audit finding #6). See
+            `obj-007-design-notes.md` §1.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/UserResponse'
-        '400':
-          description: Email already registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPError'
+                $ref: '#/components/schemas/MessageResponse'
               example:
-                detail: "The user with this email already exists in the system."
+                msg: "If this email is not already registered, we've sent you a verification code to complete your registration."
         '422':
           $ref: '#/components/responses/ValidationError'
         '503':
           description: >-
-            The verification email could not be sent. The registration was
-            rolled back (no user was created) — see `obj-005-design-notes.md`
-            §2.3.
+            A required outbound email (the new-account verification code, or the
+            existing-account "you already have an account" notification) could
+            not be sent. Body is identical for both branches — see
+            `obj-007-design-notes.md` §3.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPError'
               example:
-                detail: "Registration could not be completed: the verification email could not be sent. Please try again."
+                detail: "Registration could not be completed because a required email could not be sent. Please try again."
 
   /auth/login:
     post:

@@ -26,3 +26,17 @@ def render_password_reset_email(otp: str) -> Tuple[str, str]:
         "reset, you can safely ignore this email."
     )
     return subject, body
+
+
+def render_already_registered_email() -> Tuple[str, str]:
+    """OBJ-007 (design notes section 2): sent to the duplicate-email branch
+    of POST /auth/register instead of a new verification OTP -- deliberately
+    contains no code of any kind, so it can never be mistaken for one."""
+    subject = "Someone tried to register with your email"
+    body = (
+        "Someone tried to register an account using this email address.\n\n"
+        "If this was you, you already have an account -- try logging in or "
+        "resetting your password.\n\n"
+        "If this wasn't you, no action is needed."
+    )
+    return subject, body
