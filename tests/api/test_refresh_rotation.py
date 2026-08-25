@@ -262,6 +262,66 @@ async def test_obj010_concurrently_revoked_session_fails_closed_on_refresh(
     assert "access_token" not in resp.json()
 
 
+async def test_obj010_concurrent_rotation_401_carries_generic_no_oracle_detail(
+    client, api_prefix, user_factory, db_session
+):
+    """OBJ-010 Gate 3 addition (qa-engineer). The developer's own
+    `test_obj010_concurrently_revoked_session_fails_closed_on_refresh` (above)
+    only asserts status_code == 401 and that `access_token` is absent -- it
+    does not confirm the response BODY. `auth.py`'s `refresh_token` handler
+    raises the exact same `invalid_token_exception` object (detail="Invalid
+    or expired refresh token") on every one of its five rejection branches
+    -- no_session, reuse, expired, ver_mismatch, AND concurrent_rotation --
+    by deliberate design (the handler's own docstring: "no oracle over which
+    specific case... was hit"). This test closes that verification gap: it
+    proves the concurrent_rotation branch's client-visible detail is
+    byte-for-byte identical to the plain no_session case, i.e. a client
+    (or an attacker probing the endpoint) cannot distinguish "this session
+    was already revoked by a racing request" from "this jti never existed"
+    just by reading the response body. The internal reason IS distinguishable
+    server-side only, via the `reason="concurrent_rotation"` structured audit
+    log field (not asserted here -- audit_log call arguments are not
+    HTTP-observable and this test is a contract test).
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import update as sa_update
+
+    from app.models.refresh_session import RefreshSession
+
+    user, password = await user_factory(email="rotate-toctou-detail@example.com")
+    token = (await _login(client, api_prefix, user.email, password))["refresh_token"]
+    jti = _decode(token)["jti"]
+
+    await db_session.execute(
+        sa_update(RefreshSession)
+        .where(RefreshSession.id == jti)
+        .values(revoked_at=datetime.now(timezone.utc))
+    )
+    await db_session.commit()
+
+    concurrent_rotation_resp = await client.post(
+        f"{api_prefix}/auth/refresh", json={"refresh_token": token}
+    )
+
+    no_session_resp = await client.post(
+        f"{api_prefix}/auth/refresh", json={"refresh_token": "not-a-real-token"}
+    )
+
+    assert concurrent_rotation_resp.status_code == 401 == no_session_resp.status_code
+    assert (
+        concurrent_rotation_resp.json()["detail"]
+        == no_session_resp.json()["detail"]
+        == "Invalid or expired refresh token"
+    ), (
+        "the concurrent_rotation rejection must be byte-for-byte "
+        "indistinguishable from an ordinary no-matching-session 401 -- a "
+        "differing detail string here would be a new oracle leaking "
+        "internal race-detection state to the client, defeating the "
+        "handler's own no-oracle design guarantee"
+    )
+
+
 async def test_expired_refresh_session_returns_401(client, api_prefix, user_factory):
     """design notes section 2, branch 3: an ordinary time-expired session
     row (never revoked) is a plain 401 -- largely redundant with the JWT's
