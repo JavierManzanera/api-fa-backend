@@ -1,4 +1,4 @@
-from typing import Annotated, List, Union
+from typing import Annotated, List, Optional, Union
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import AnyHttpUrl, PostgresDsn, computed_field, field_validator, model_validator
 from functools import lru_cache
@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     # Required, no default, matching every other POSTGRES_* field's existing
     # convention -- every environment must say what it wants.
     POSTGRES_SSL_MODE: str
+
+    # Security audit finding #18 (docs/security/audit-report.md, OBJ-012
+    # Gate 3 section; full investigation:
+    # docs/database/obj-012-tls-dast-verification.md, Finding 1): optional
+    # path to a CA certificate file to trust for POSTGRES_SSL_MODE=
+    # verify-full, IN ADDITION TO (not instead of) the OS default trust
+    # store. Optional, defaulting to None -- unlike POSTGRES_SSL_MODE, this
+    # is not a "every environment must say what it wants" field: leaving it
+    # unset preserves today's existing verify-full behavior (OS trust store
+    # only) for every deployment that already works against a
+    # publicly-trusted CA. Set this to pin a private/self-signed CA for a
+    # self-hosted Postgres instance -- without it, verify-full fails closed
+    # against any cert the OS doesn't already trust, which was pushing
+    # self-hosted/private-CA operators toward the weaker, MITM-vulnerable
+    # 'require' mode instead.
+    POSTGRES_SSL_ROOT_CERT: Optional[str] = None
 
     SECRET_KEY: str
     ALGORITHM: str

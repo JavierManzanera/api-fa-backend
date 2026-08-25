@@ -162,3 +162,92 @@ class TestUnrecognizedMode:
         build = _import_build_ssl_connect_arg()
         with pytest.raises(ValueError):
             build(bad_mode)
+
+
+class TestVerifyFullModeRootCert:
+    """Audit finding #18 (docs/security/audit-report.md, OBJ-012 Gate 3
+    section; full investigation: docs/database/obj-012-tls-dast-verification.md,
+    Finding 1) -- verify-full had no app-level way to pin a private/
+    self-signed CA, since `_build_ssl_connect_arg` called bare
+    `ssl.create_default_context()` with no `cafile`. Companion to
+    tests/unit/test_postgres_ssl_root_cert_startup.py (which tests the
+    Settings FIELD itself); this class tests that the translation function
+    forwards an explicit root cert path through to
+    `ssl.create_default_context(cafile=...)`.
+
+    Today (red phase): `_build_ssl_connect_arg` takes a single `mode`
+    argument -- every test below fails with a TypeError ("unexpected
+    keyword argument 'root_cert'") until developer adds the parameter.
+    """
+
+    def test_verify_full_mode_passes_root_cert_as_cafile(self, monkeypatch):
+        from app.core import database
+
+        captured = {}
+        real_create_default_context = ssl.create_default_context
+
+        def fake_create_default_context(*args, **kwargs):
+            captured.update(kwargs)
+            # Delegate WITHOUT the fake (nonexistent-on-disk) cafile -- this
+            # spy only needs to observe what _build_ssl_connect_arg passed
+            # through, not actually load a real cert file from that path.
+            return real_create_default_context(*args)
+
+        monkeypatch.setattr(
+            database.ssl, "create_default_context", fake_create_default_context
+        )
+
+        database._build_ssl_connect_arg(
+            "verify-full", root_cert="/path/to/private-ca.pem"
+        )
+
+        assert captured.get("cafile") == "/path/to/private-ca.pem", (
+            "'verify-full' mode must forward POSTGRES_SSL_ROOT_CERT through "
+            "as ssl.create_default_context(cafile=...) so operators can pin "
+            "a private/self-signed CA instead of relying solely on the OS "
+            "default trust store"
+        )
+
+    def test_verify_full_mode_without_root_cert_omits_cafile(self, monkeypatch):
+        """No regression for every existing deployment: root_cert unset (the
+        default) must behave exactly as before -- cafile=None, i.e. OS
+        default trust store only."""
+        from app.core import database
+
+        captured = {}
+        real_create_default_context = ssl.create_default_context
+
+        def fake_create_default_context(*args, **kwargs):
+            captured.update(kwargs)
+            return real_create_default_context(*args, **kwargs)
+
+        monkeypatch.setattr(
+            database.ssl, "create_default_context", fake_create_default_context
+        )
+
+        database._build_ssl_connect_arg("verify-full")
+
+        assert captured.get("cafile") is None, (
+            "when POSTGRES_SSL_ROOT_CERT is unset, 'verify-full' must not "
+            "change behavior -- cafile stays None"
+        )
+
+    def test_verify_full_mode_with_root_cert_still_enforces_hostname_and_verification(
+        self, monkeypatch
+    ):
+        """Pinning a custom CA must not weaken verify-full's posture --
+        still CERT_REQUIRED + hostname checking, just against a different
+        trust anchor."""
+        build = _import_build_ssl_connect_arg()
+        ctx = build("verify-full", root_cert=None)
+        assert ctx.check_hostname is True
+        assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+    def test_require_mode_ignores_root_cert(self):
+        """root_cert is verify-full-specific; passing it alongside 'require'
+        must not change require's own (weaker, intentionally
+        unverified) posture."""
+        build = _import_build_ssl_connect_arg()
+        ctx = build("require", root_cert="/path/to/private-ca.pem")
+        assert ctx.check_hostname is False
+        assert ctx.verify_mode == ssl.CERT_NONE
